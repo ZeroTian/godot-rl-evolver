@@ -1,0 +1,24 @@
+# Python venv / 构建产物(放仓库外,如 ~/.local/share/godot-rl-venv)
+venv/
+.venv/
+__pycache__/
+*.pyc
+
+# 训练产物 / 模型 / 录像 / 日志(不入库)
+*.zip
+*.onnx
+rec/
+*.png
+*.gif
+*.log
+game_dbg.log
+
+# Godot 导入缓存
+.godot/
+.import/
+
+# 私密/凭证(永不提交)
+.env
+*cookies*.txt
+*.key
+*secret*
