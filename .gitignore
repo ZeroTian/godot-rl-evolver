@@ -1,6 +1,7 @@
 # Python venv / 构建产物(放仓库外,如 ~/.local/share/godot-rl-venv)
 venv/
 .venv/
+.testvenv/
 __pycache__/
 *.pyc
 
@@ -13,9 +14,16 @@ rec/
 *.log
 game_dbg.log
 
+# telemetry 运行产物(不入库)
+telemetry/
+report.json
+
 # Godot 导入缓存
 .godot/
 .import/
+
+# OMC 工作目录(不入库)
+.omc/
 
 # 私密/凭证(永不提交)
 .env
