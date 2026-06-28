@@ -9,8 +9,9 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 体感等**非故障问题** → 喂给 LLM 闭环改关卡/数值。进化循环:**试玩 → 度量 → 优化 → 再试玩**。
 
 - **当前已建成**:试玩(RL 玩家)环 + 度量/诊断环 + LLM 优化闭环(阶段1 数值)。**未建**:优化环阶段2/3(结构 `.tscn`/逻辑 `.gd` 改动)+ 循环编排。
-- 这是**工具链/模板仓**,不是某个具体游戏。真实跑通的样例在 `example_platformer/`
-  (从 `godot-study/platformer` 抽出)。
+- 这是**工具链/模板仓**,不是某个具体游戏。仓内测试床 `testbed_platformer/`(2D 平台跳跃,
+  来源 `godot-study/platformer`)是可直接运行的 Godot 项目,已入仓;参考样例在 `example_platformer/`。
+  测试床所用**模型不入仓**,须由 `MODEL` 环境变量显式指定外部路径,模型 SHA-256 进入运行 provenance。
 - 设计文档在 `docs/specs/2026-06-28-telemetry-diagnosis-design.md`,实现计划在
   `docs/plans/`。改度量/诊断相关代码前应先读 spec。
 
@@ -113,6 +114,10 @@ episode 把指标落盘成 **JSONL**;`harness/diagnose.py` 离线读取、套可
 
 `PROJ`(必填,Godot 项目目录)、`SCENE`(必填,`res://` 场景)、`GODOT`
 (默认 `/mnt/d/Godot/Godot_console.exe`)、`VENV`、`SPEEDUP`(默认 8,训练/推理须一致)、
-`TIMESTEPS`、`WARM_START`(热启动旧模型)、`MODEL`/`SAVE_PATH`、`INFER_STEPS`、
+`TIMESTEPS`、`WARM_START`(热启动旧模型)、`MODEL`/`SAVE_PATH`(模型**不入库**,显式外部路径)、
+`EVAL_SEED`(单次评估种子,同时控制 Python/NumPy/PyTorch/SB3 + Godot `--env_seed`)、
+`EVAL_SEEDS`(默认 `1,2,3`)、`EVAL_EPISODES`(默认 20)、`MAX_EVAL_STEPS`(默认 40000)、
+`EVAL_TIMEOUT_SECONDS`(默认 900)、`MIN_IMPROVEMENT`(默认 0.1)、
+`ARTIFACT_ROOT`(默认 `$REPO_ROOT/.artifacts/opt`,gitignore 不入库)、
 `DETERMINISTIC`(默认 0)、`DIAGNOSE`(默认 1)、`TELEMETRY_DIR`、`GRID_CELL`(默认 64)。
 完整说明见 `README.md` 末尾的表。

@@ -5,8 +5,11 @@
 等非故障问题**,再喂给 LLM 闭环改关卡/数值/玩法,跑「**试玩 → 度量 → 优化 → 再试玩**」的进化循环。
 当前内置的 RL 试玩员是这条自进化链路里的「玩家」一环。
 
-> 从 `godot-study/platformer`(一个 2D 平台跳跃实战项目)的 RL 工程抽出通用部分而成。
-> 完整可运行的样例见 [`example_platformer/`](example_platformer/)。
+> 仓内附带可直接运行的 Godot 测试床 [`testbed_platformer/`](testbed_platformer/)（2D 平台跳跃，
+> 来源 `godot-study/platformer`，已入仓）；参考样例见 [`example_platformer/`](example_platformer/)。
+> **注意**：测试床本身入仓，但所用模型（`ppo_game.zip`）**不入仓**，须由 `MODEL` 环境变量显式指定
+> 外部路径（默认 `~/.local/share/godot-rl-venv/ppo_game.zip`）；模型的 SHA-256 进入每条运行记录的
+> `provenance` 字段，保证可追溯。
 
 ## 核心思路:虚拟手柄(不改游戏)
 
@@ -124,8 +127,9 @@ python harness/diagnose.py 路径/run_*.jsonl [--out report.json] [--thresholds 
 + 全程 git 优化分支可回滚 + `PROTECTED_PATHS` 禁改路径入口 + 预算上限(轮数/搜索次数/早停)。
 
 **参数化接入**(在度量接入基础上加):把 `template/tunables.json` + `template/tunables.gd` 拷到
-`res://rl/`,在 `project.godot` 注册 `Tunables` autoload,游戏脚本用 `Tunables.get("gap_width", 120)`
+`res://rl/`,在 `project.godot` 注册 `Tunables` autoload,游戏脚本用 `Tunables.get_param("gap_width", 120)`
 取代硬编码——数值改动改 JSON 即生效,无需碰代码(这是「解耦/可回滚」的载体)。
+> ⚠️ 使用 `Tunables.get_param()` 而非 `Tunables.get()`：后者与 Godot 内置 `Object.get()` 冲突。
 
 **跑**:
 ```bash
@@ -150,16 +154,30 @@ PROJ=... SCENE=... MODEL=~/.local/share/godot-rl-venv/ppo_game.zip ANTHROPIC_API
 | `TIMESTEPS` | 60000 | 训练步数 |
 | `SPEEDUP` | 8 | 加速倍率(训练/推理须一致) |
 | `WARM_START` | — | 热启动的旧模型路径 |
-| `SAVE_PATH` / `MODEL` | venv/ppo_game.zip | 模型保存 / 推理加载路径 |
-| `INFER_STEPS` | 600 | 推理步数 |
-| `DETERMINISTIC` | 0 | 推理是否用 argmax(概率性技能设 0) |
-| `DIAGNOSE` | 1 | 推理结束后是否自动跑 `diagnose.py`(0=关) |
+| `SAVE_PATH` / `MODEL` | venv/ppo_game.zip | 模型保存 / 推理加载路径（**模型不入库**，须显式外部路径） |
+| `EVAL_SEED` | — | 单次评估随机种子；同时控制 Python/NumPy/PyTorch/SB3 + Godot `--env_seed` |
+| `EVAL_SEEDS` | `1,2,3` | 优化闭环每轮使用的种子列表（逗号分隔）；配对差值消除种子噪声 |
+| `EVAL_EPISODES` | 20 | 每个 seed 必须完成的局数；不足则该次子评估失败 |
+| `MAX_EVAL_STEPS` | 40000 | 每个 seed 的步数预算；先于 episode 目标耗尽则非 0 退出 |
+| `EVAL_TIMEOUT_SECONDS` | 900 | 单 seed 推理超时（秒）；超时视为失败 |
+| `MIN_IMPROVEMENT` | 0.1 | 接受门阈值；配对改善均值必须**严格大于**此值才接受 |
+| `ARTIFACT_ROOT` | `$REPO_ROOT/.artifacts/opt` | 运行产物根目录（telemetry/report/memory）；被 gitignore，不入库 |
+| `DETERMINISTIC` | 0 | 推理是否用 argmax（概率性技能设 0） |
+| `DIAGNOSE` | 1 | 推理结束后是否自动跑 `diagnose.py`（0=关） |
 | `TELEMETRY_DIR` | `$PROJ/rl/telemetry` | telemetry JSONL 落盘目录 |
-| `GRID_CELL` | 64 | 探索覆盖/死亡热点的网格边长(像素) |
-| `STAGE` | 1 | 优化改动面:1=数值 / 2=+结构 / 3=+逻辑 |
-| `TARGET_COMPLETION` | 0.65 | 优化目标通关率(客观分数用) |
+| `GRID_CELL` | 64 | 探索覆盖/死亡热点的网格边长（像素） |
+| `STAGE` | 1 | 优化改动面：1=数值 / 2=+结构 / 3=+逻辑 |
+| `TARGET_COMPLETION` | 0.65 | 优化目标通关率（客观分数用） |
 | `MAX_ROUNDS` / `PATIENCE` | 8 / 3 | 闭环最大轮数 / 连续无改善早停轮数 |
 | `SEARCH_CALLS` | 12 | 贝叶斯每轮评估预算 |
-| `RETRAIN_EACH` | 0 | 评估是否每次热启动重训(0=纯推理省钱) |
+| `RETRAIN_EACH` | 0 | 评估是否每次热启动重训（0=纯推理省钱） |
 | `PROTECTED_PATHS` | `harness/**,.git/**,tests/**,docs/**` | 禁止 LLM 修改的路径 glob |
-| `ANTHROPIC_API_KEY` | (优化必填) | LLM key,环境变量,**绝不入库** |
+| `ANTHROPIC_API_KEY` | （优化必填） | LLM key，环境变量，**绝不入库**；变量名本身可出现在文档/脚本/测试中，值不可入库 |
+
+> **固定种子链**：`EVAL_SEED`（或 `EVAL_SEEDS` 中每个值）同时传给 Python `random.seed` /
+> `np.random.seed` / `torch.manual_seed` / `model.set_random_seed`，以及 Godot `--env_seed`，
+> 保证同一种子的 candidate—baseline 配对差值消除共变噪声。
+>
+> **artifact 目录**：`.artifacts/opt/` 存放单次 run 的 telemetry/report 和跨 run 的 memory，
+> 已被 `.gitignore` 排除，不会入库。优化 run 只向 `testbed_platformer/rl/tunables.json`
+> 等白名单路径提交 git commit。
