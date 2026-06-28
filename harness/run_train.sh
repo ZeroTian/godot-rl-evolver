@@ -30,8 +30,15 @@ PYPID=$!
 
 sleep 6   # 等 Python 在端口上监听好
 
+# persona 校准(可选):PERSONA=<name> 让 game_agent 在训练期读 personas/<name>.json 的 reward 权重
+# 塑形该 persona 的策略。WSL→Windows Godot 必须经 WSLENV 透传 PERSONA(原始字符串,非路径)。
+if [ -n "${PERSONA:-}" ]; then
+  echo "    persona 校准: PERSONA=$PERSONA (读 personas/$PERSONA.json 的 reward 权重)"
+fi
+
 echo "=== 启动 Godot 连入训练 ==="
-( cd "$PROJ" && "$GODOT" --headless --path . "$SCENE" --port=$PORT --speedup=$SPEEDUP ) \
+( cd "$PROJ" && PERSONA="${PERSONA:-}" WSLENV="${WSLENV:+$WSLENV:}PERSONA" \
+  "$GODOT" --headless --path . "$SCENE" --port=$PORT --speedup=$SPEEDUP ) \
   > /tmp/rl_godot.log 2>&1 &
 GPID=$!
 
