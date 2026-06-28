@@ -9,10 +9,19 @@ __pycache__/
 *.zip
 *.onnx
 rec/
-*.png
 *.gif
 *.log
 game_dbg.log
+# PNG 只排除根级和 harness 下的截图/产物；testbed grey-box 资源通过下方白名单放行
+*.png
+!testbed_platformer/assets/grey_box/*.png
+
+# 优化闭环运行产物（telemetry/report/memory/模型，不入库）
+.artifacts/
+
+# testbed Godot 导入缓存（不入库）
+testbed_platformer/.godot/
+testbed_platformer/.import/
 
 # telemetry 运行产物(不入库)
 telemetry/

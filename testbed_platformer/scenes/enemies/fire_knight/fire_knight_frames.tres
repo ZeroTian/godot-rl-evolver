@@ -1,0 +1,35 @@
+; GREY-BOX ASSET — 替代受版权保护的 itch.io 像素素材
+; 原始素材 (chierit Elementals Fire Knight FREE) 无明确再分发许可，不得入库。
+; 此文件使用仓库自有纯色占位图 (res://assets/grey_box/fire_knight.png)，
+; 保留原有动画名称（中文）以维持脚本 play() 调用不变。
+[gd_resource type="SpriteFrames" load_steps=2 format=3]
+
+[ext_resource type="Texture2D" path="res://assets/grey_box/fire_knight.png" id="t1"]
+
+[resource]
+animations = [{
+"frames": [{"duration": 1.0, "texture": ExtResource("t1")}],
+"loop": true,
+"name": &"移动",
+"speed": 8.0
+}, {
+"frames": [{"duration": 1.0, "texture": ExtResource("t1")}],
+"loop": false,
+"name": &"攻击1",
+"speed": 10.0
+}, {
+"frames": [{"duration": 1.0, "texture": ExtResource("t1")}],
+"loop": false,
+"name": &"攻击2",
+"speed": 8.0
+}, {
+"frames": [{"duration": 1.0, "texture": ExtResource("t1")}],
+"loop": false,
+"name": &"受击",
+"speed": 10.0
+}, {
+"frames": [{"duration": 1.0, "texture": ExtResource("t1")}],
+"loop": false,
+"name": &"死亡",
+"speed": 10.0
+}]

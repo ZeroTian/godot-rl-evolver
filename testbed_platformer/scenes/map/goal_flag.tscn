@@ -1,0 +1,23 @@
+[gd_scene format=3]
+
+[node name="GoalFlag" type="Node2D"]
+
+[node name="Pole" type="Polygon2D" parent="."]
+color = Color(0.82, 0.84, 0.88, 1)
+polygon = PackedVector2Array(-2, 2, 2, 2, 2, -92, -2, -92)
+
+[node name="PoleBase" type="Polygon2D" parent="."]
+color = Color(0.5, 0.5, 0.55, 1)
+polygon = PackedVector2Array(-8, 2, 8, 2, 6, -6, -6, -6)
+
+[node name="Finial" type="Polygon2D" parent="."]
+color = Color(1, 0.85, 0.2, 1)
+polygon = PackedVector2Array(-3, -92, 3, -92, 3, -98, -3, -98)
+
+[node name="Flag" type="Polygon2D" parent="."]
+color = Color(0.92, 0.22, 0.2, 1)
+polygon = PackedVector2Array(2, -90, 2, -62, 36, -76)
+
+[node name="FlagShade" type="Polygon2D" parent="."]
+color = Color(0.72, 0.15, 0.14, 1)
+polygon = PackedVector2Array(2, -76, 2, -62, 36, -76)

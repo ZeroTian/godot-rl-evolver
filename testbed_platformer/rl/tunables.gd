@@ -8,9 +8,8 @@
 #        Tunables="*res://rl/Tunables.gd"
 #      或在编辑器: Project → Project Settings → Autoload → 添加 Tunables.gd
 #   4. 游戏脚本中把硬编码常量替换为:
-#        var gap = Tunables.get_param("gap_width", 120.0)
+#        var gap = Tunables.get("gap_width", 120.0)
 #      优化器改 tunables.json 的 value 字段，下次启动自动生效，无需碰 .gd/.tscn
-#      (方法名用 get_param 而非 get:get 会和 Godot 内置 Object.get() 冲突)
 #
 # ★ 容错:
 #   - 文件缺失 / JSON 解析失败时不崩溃，均返回 default 值
@@ -31,7 +30,7 @@ func _ready() -> void:
 
 ## 读取参数值，找不到或文件缺失时返回 default。
 ## 示例: var force = Tunables.get_param("jump_force", 400.0)
-## 注意:方法名是 get_param 不是 get —— get 会覆盖 Godot 内置 Object.get(),有隐患。
+## 注意: 不能命名为 get()，会与 GDScript Object 内置方法冲突。
 func get_param(key: String, default = null):
 	return _params.get(key, default)
 

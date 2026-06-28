@@ -1,0 +1,8 @@
+{
+  "version": 1,
+  "params": {
+    "enemy_hp":    {"value": 40,    "range": [20, 100],       "type": "int",   "desc": "火骑士生命值",   "files": ["res://rl/game_env.gd"]},
+    "enemy_speed": {"value": 50.0,  "range": [25.0, 100.0],   "type": "float", "desc": "火骑士巡逻速度", "files": ["res://scenes/enemies/fire_knight/run_state.gd"]},
+    "jump_force":  {"value": 360.0, "range": [280.0, 440.0],  "type": "float", "desc": "玩家起跳速度",   "files": ["res://scenes/player/states/jump.gd"]}
+  }
+}
