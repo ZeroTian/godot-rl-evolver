@@ -116,6 +116,16 @@ THRESHOLDS = {
     "stall_len_frac": 0.9, "stall_return": 0.0,
     "redundant_usage": 0.01, "ent_min": 0.5, "cov_ent_min": 1.0,
     "unstable_cv": 1.5,
+    "persona_spread": 0.3,  # 跨 persona 通关率极差超此 → difficulty_varies_by_persona
+}
+
+# 跨 persona 可比的 reward 无关 issue 白名单(critic C2):这些规则基于通关率/
+# 死亡位置/term/熵/覆盖,与 reward 塑形无关,跨 persona 可比。
+# reward 耦合(基于 mean_return/return_std)、跨 persona 不可比的被排除:
+# progress_stall, unstable_difficulty。
+_PERSONA_COMPARABLE_ISSUES = {
+    "difficulty_too_hard", "difficulty_too_easy", "death_hotspot",
+    "done_reason_skew", "redundant_action", "monotony",
 }
 
 
@@ -232,6 +242,85 @@ def _top_cells(grid, k=3):
     """按 count 降序取前 k 个格子的格索引(evidence 仅供参考)。"""
     items = sorted(grid.items(), key=lambda kv: kv[1], reverse=True)[:k]
     return [[c[0], c[1]] for c, _ in items]
+
+
+def cross_persona_profile(reports_by_persona, thresholds=None):
+    """跨 persona 聚合成「对谁而言」的体验剖面(主观体验层 · Task 4)。
+
+    输入 {persona_name: report}(report = build_report 的产物)。输出独立结构:
+    - per_persona: 各 persona 的 completion_rate/mean_len/term_distribution +
+      issues(**仅保留 _PERSONA_COMPARABLE_ISSUES**;reward 耦合的
+      progress_stall/unstable_difficulty 被剔除——critic C2)。
+    - spread: 用 **completion_rate**(由几何 GOAL_X 定的 term,reward 无关)算
+      max-min 离散 + 谁最难/最易。
+    - soft_issues: difficulty_varies_by_persona / persona_specific_hotspot。
+
+    所有 soft_issue 标 type='soft'、for_persona=True、agent_relative=True,**绝不**
+    写回任何 report['issues'](它驱动 has_high_issue 早停 + 喂 objective.score——
+    Goodhart 防火墙 critic M4)。本函数**不修改**传入的 report。
+    """
+    t = dict(THRESHOLDS)
+    if thresholds:
+        t.update(thresholds)
+
+    per_persona = {}
+    for name, report in reports_by_persona.items():
+        summary = report.get("summary", {})
+        comparable = [i for i in report.get("issues", [])
+                      if i.get("id") in _PERSONA_COMPARABLE_ISSUES]
+        per_persona[name] = {
+            "completion_rate": summary.get("completion_rate", 0.0),
+            "mean_len": summary.get("mean_len", 0.0),
+            "term_distribution": dict(summary.get("term_distribution", {})),
+            "issues": comparable,
+        }
+
+    soft_issues = []
+    spread = {}
+    if per_persona:
+        crs = {name: p["completion_rate"] for name, p in per_persona.items()}
+        hardest = min(crs, key=crs.get)  # 通关率最低 = 最难
+        easiest = max(crs, key=crs.get)
+        completion_spread = crs[easiest] - crs[hardest]
+        spread = {
+            "completion_spread": completion_spread,
+            "hardest": hardest,
+            "easiest": easiest,
+            "completion_rates": crs,
+        }
+        # difficulty_varies_by_persona:通关率极差超阈值(严格大于)
+        if completion_spread > t["persona_spread"]:
+            soft_issues.append(_soft_issue(
+                "difficulty_varies_by_persona", "tuning",
+                "难度随 persona 显著变化:通关率极差 %.0f%%(%s 最难 %.0f%%,"
+                "%s 最易 %.0f%%)"
+                % (completion_spread * 100, hardest, crs[hardest] * 100,
+                   easiest, crs[easiest] * 100),
+                {"completion_spread": completion_spread, "hardest": hardest,
+                 "easiest": easiest, "completion_rates": crs,
+                 "threshold": t["persona_spread"]}))
+
+        # persona_specific_hotspot:某 persona 有 death_hotspot 而非全员都有
+        with_hotspot = sorted(
+            name for name, p in per_persona.items()
+            if any(i.get("id") == "death_hotspot" for i in p["issues"]))
+        if with_hotspot and len(with_hotspot) < len(per_persona):
+            without = sorted(set(per_persona) - set(with_hotspot))
+            soft_issues.append(_soft_issue(
+                "persona_specific_hotspot", "structural",
+                "死亡热点仅对部分 persona 存在(%s 有,%s 无),疑似 persona 专属难点"
+                % (", ".join(with_hotspot), ", ".join(without)),
+                {"personas": with_hotspot, "without": without}))
+
+    return {"per_persona": per_persona, "spread": spread,
+            "soft_issues": soft_issues}
+
+
+def _soft_issue(id, category, message, evidence):
+    """主观/剖面 soft issue:标记不进被消费的 report['issues'](Goodhart 防火墙)。"""
+    return {"id": id, "type": "soft", "for_persona": True,
+            "agent_relative": True, "category": category,
+            "message": message, "evidence": evidence}
 
 
 def build_report(agg, issues, meta=None):

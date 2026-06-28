@@ -266,3 +266,121 @@ def test_main_thresholds_override(tmp_path):
                    "--thresholds", '{"hard_completion": 0.30}'])
     rep = json.loads(out.read_text())
     assert "difficulty_too_hard" in {i["id"] for i in rep["issues"]}
+
+
+# ── 循环 E:cross_persona_profile(主观体验层 · Task 4)────────────────
+def _persona_report(name="p", completion_rate=0.5, mean_len=300.0,
+                    term_distribution=None, issue_ids=None):
+    """构造一份 per-persona report(build_report 风格的子集)。
+    issue_ids 里的每个 id 生成一条最小 issue,放进 report['issues']。"""
+    issues = [{"id": iid, "severity": "high", "category": "structural",
+               "metric": "x", "value": 1, "threshold": 0,
+               "message": "m", "evidence": {}}
+              for iid in (issue_ids or [])]
+    return {
+        "run_id": name,
+        "generated_for": "res://t.tscn",
+        "agent_relative": True,
+        "summary": {
+            "n_episodes": 60,
+            "completion_rate": completion_rate,
+            "mean_len": mean_len,
+            "mean_return": 10.0,
+            "term_distribution": term_distribution or {"goal": completion_rate,
+                                                       "fall": 1.0 - completion_rate},
+        },
+        "issues": issues,
+    }
+
+
+def test_cross_persona_spread_detects_difficulty_variance():
+    reports = {
+        "aggressive": _persona_report("aggressive", completion_rate=0.8),
+        "cautious": _persona_report("cautious", completion_rate=0.4),
+        "explorer": _persona_report("explorer", completion_rate=0.7),
+    }
+    prof = diagnose.cross_persona_profile(reports)
+    soft_ids = {i["id"] for i in prof["soft_issues"]}
+    assert "difficulty_varies_by_persona" in soft_ids
+    dv = next(i for i in prof["soft_issues"]
+              if i["id"] == "difficulty_varies_by_persona")
+    # 最难 = 通关率最低的 persona = cautious
+    assert dv["evidence"]["hardest"] == "cautious"
+    # spread = max-min = 0.8-0.4 = 0.4
+    assert prof["spread"]["completion_spread"] == pytest.approx(0.4)
+    assert prof["spread"]["hardest"] == "cautious"
+    assert prof["spread"]["easiest"] == "aggressive"
+
+
+def test_cross_persona_specific_hotspot():
+    reports = {
+        "aggressive": _persona_report("aggressive", completion_rate=0.6,
+                                      issue_ids=["death_hotspot"]),
+        "cautious": _persona_report("cautious", completion_rate=0.6),
+    }
+    prof = diagnose.cross_persona_profile(reports)
+    soft_ids = {i["id"] for i in prof["soft_issues"]}
+    assert "persona_specific_hotspot" in soft_ids
+    psh = next(i for i in prof["soft_issues"]
+               if i["id"] == "persona_specific_hotspot")
+    assert "aggressive" in psh["evidence"]["personas"]
+    assert "cautious" not in psh["evidence"]["personas"]
+
+
+def test_cross_persona_all_similar_no_soft_issue():
+    # 通关率全接近(0.60/0.62/0.61),极差 0.02 < persona_spread(0.3)→ 不报
+    reports = {
+        "a": _persona_report("a", completion_rate=0.60),
+        "b": _persona_report("b", completion_rate=0.62),
+        "c": _persona_report("c", completion_rate=0.61),
+    }
+    prof = diagnose.cross_persona_profile(reports)
+    soft_ids = {i["id"] for i in prof["soft_issues"]}
+    assert "difficulty_varies_by_persona" not in soft_ids
+    # 无独有热点 → 也不报 persona_specific_hotspot
+    assert "persona_specific_hotspot" not in soft_ids
+
+
+def test_cross_persona_excludes_return_coupled_issues():
+    reports = {
+        "a": _persona_report("a", completion_rate=0.6,
+                             issue_ids=["progress_stall", "unstable_difficulty",
+                                        "monotony"]),
+        "b": _persona_report("b", completion_rate=0.6),
+    }
+    prof = diagnose.cross_persona_profile(reports)
+    comparable = {i["id"] for i in prof["per_persona"]["a"]["issues"]}
+    # reward 耦合的两条被剔除,reward 无关的 monotony 保留
+    assert "progress_stall" not in comparable
+    assert "unstable_difficulty" not in comparable
+    assert "monotony" in comparable
+
+
+def test_soft_issues_marked_and_not_in_consumed_issues():
+    rep_a = _persona_report("a", completion_rate=0.8,
+                            issue_ids=["death_hotspot"])
+    rep_b = _persona_report("b", completion_rate=0.3)
+    a_issues_before = list(rep_a["issues"])
+    b_issues_before = list(rep_b["issues"])
+    prof = diagnose.cross_persona_profile({"a": rep_a, "b": rep_b})
+    assert prof["soft_issues"]  # 应有 soft issue
+    for si in prof["soft_issues"]:
+        assert si["type"] == "soft"
+        assert si["for_persona"] is True
+        assert si["agent_relative"] is True
+    # 不修改传入 report 的 issues(不写回被消费路径)
+    assert rep_a["issues"] == a_issues_before
+    assert rep_b["issues"] == b_issues_before
+
+
+def test_cross_persona_spread_threshold_override():
+    # 极差 0.2:默认 persona_spread=0.3 不报;降到 0.1 则报
+    reports = {
+        "a": _persona_report("a", completion_rate=0.7),
+        "b": _persona_report("b", completion_rate=0.5),
+    }
+    assert "difficulty_varies_by_persona" not in {
+        i["id"] for i in diagnose.cross_persona_profile(reports)["soft_issues"]}
+    over = diagnose.cross_persona_profile(reports, {"persona_spread": 0.1})
+    assert "difficulty_varies_by_persona" in {
+        i["id"] for i in over["soft_issues"]}
