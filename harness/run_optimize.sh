@@ -1,7 +1,7 @@
 #!/bin/bash
 # LLM 优化闭环入口（阶段 1：数值闭环 MVP）。
 #
-# 改动要点（Task 8）：
+# 改动要点：
 #   · REPO_ROOT 默认本仓（godot-rl-evolver），不再是外部 PROJ。
 #   · PROJ 默认 $REPO_ROOT/testbed_platformer（本仓测试床）。
 #   · Gate 0：先 git status --porcelain 检查脏树，非空立即退出（在建分支前）。
@@ -76,9 +76,8 @@ OPT_RUN_ID="opt-$(date +%Y%m%d-%H%M%S)-$$"
 : "${MIN_IMPROVEMENT:=0.1}"
 : "${ARTIFACT_ROOT:=$REPO_ROOT/.artifacts/opt}"
 
-# ─── Artifact / Memory / Report 路径（均在 .artifacts/opt/ 下，不入库）──────
+# ─── Artifact / Memory 路径（均在 .artifacts/opt/ 下，不入库）──────────────
 : "${MEMORY_PATH:=$ARTIFACT_ROOT/memory}"
-: "${REPORT_PATH:=$ARTIFACT_ROOT/runs/$OPT_RUN_ID/report.json}"
 
 # ─── 闭环调优参数 ────────────────────────────────────────────────────────────
 : "${STAGE:=1}"
@@ -108,7 +107,7 @@ source "$VENV/bin/activate"
 
 # ─── 打印摘要 ────────────────────────────────────────────────────────────────
 MODEL_SHA256="$(sha256sum "$MODEL" 2>/dev/null | awk '{print $1}')"
-echo "=== LLM 优化闭环 Task 8 ==="
+echo "=== LLM 优化闭环 ==="
 echo "    Run ID     : $OPT_RUN_ID"
 echo "    Model      : $MODEL"
 echo "    Model SHA  : ${MODEL_SHA256:-（sha256sum 不可用）}"
@@ -128,7 +127,7 @@ echo "=== 切到优化分支 $OPT_BRANCH（在 $REPO_ROOT）==="
 export REPO_ROOT PROJ SCENE MODEL SPEEDUP GODOT VENV
 export STAGE TARGET_COMPLETION MAX_ROUNDS PATIENCE SEARCH_CALLS RETRAIN_EACH PROTECTED_PATHS
 export SMOKE_MAX_STEPS SMOKE_TIMEOUT_SECONDS
-export TUNABLES_PATH MEMORY_PATH REPORT_PATH
+export TUNABLES_PATH MEMORY_PATH
 export OPT_RUN_ID ARTIFACT_ROOT
 export EVAL_SEEDS EVAL_EPISODES MAX_EVAL_STEPS EVAL_TIMEOUT_SECONDS MIN_IMPROVEMENT
 export ANTHROPIC_API_KEY LLM_BACKEND THRESHOLDS

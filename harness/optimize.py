@@ -20,7 +20,7 @@
 配置经环境变量(spec §9):
   STAGE / TARGET_COMPLETION / MAX_ROUNDS / PATIENCE / SEARCH_CALLS
   / RETRAIN_EACH / PROTECTED_PATHS / PROJ / SCENE / MODEL / SPEEDUP
-  / TUNABLES_PATH / MEMORY_PATH / REPORT_PATH
+  / TUNABLES_PATH / MEMORY_PATH
 """
 from __future__ import annotations
 
@@ -109,7 +109,6 @@ class Config:
             os.path.join(self.proj, "rl", "tunables.json") if self.proj else "",
         )
         self.memory_path = os.environ.get("MEMORY_PATH", "memory.json")
-        self.report_path = os.environ.get("REPORT_PATH", "report.json")
         self.repo_root = os.environ.get("REPO_ROOT", ".")
 
         # 配对评估配置(spec §9;Task 7 会补严格校验,这里只读默认值)。
@@ -169,45 +168,6 @@ class Config:
 def _load_json(path: str) -> dict:
     with open(path, encoding="utf-8") as f:
         return json.load(f)
-
-
-# --------------------------------------------------------------------------- #
-# 试玩 + 诊断(默认实现,可被测试注入替换)                                       #
-# --------------------------------------------------------------------------- #
-
-def run_playtest_and_diagnose(cfg: Config) -> dict:
-    """跑一次 run_infer.sh(试玩 + 诊断),读回 report.json。
-
-    复用第一/二环工具:run_infer.sh 内部已 run_infer + diagnose。
-    返回解析后的 report dict。失败抛 RuntimeError。
-    """
-    harness_dir = os.path.dirname(os.path.abspath(__file__))
-    script = os.path.join(harness_dir, "run_infer.sh")
-    env = dict(os.environ)
-    env["DIAGNOSE"] = "1"
-    proc = subprocess.run(
-        ["bash", script],
-        env=env,
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-    if proc.returncode != 0:
-        raise RuntimeError(
-            f"run_infer.sh 失败 (rc={proc.returncode}):\n{proc.stderr[-2000:]}"
-        )
-    # diagnose.py 默认把 report.json 写到 telemetry 目录;约定 REPORT_PATH 指向它。
-    telemetry_dir = env.get(
-        "TELEMETRY_DIR", os.path.join(cfg.proj, "rl", "telemetry")
-    )
-    report_path = cfg.report_path
-    if not os.path.exists(report_path):
-        candidate = os.path.join(telemetry_dir, "report.json")
-        if os.path.exists(candidate):
-            report_path = candidate
-    if not os.path.exists(report_path):
-        raise RuntimeError(f"未找到 report.json(查找 {cfg.report_path} / {telemetry_dir})")
-    return _load_json(report_path)
 
 
 # --------------------------------------------------------------------------- #
