@@ -357,3 +357,195 @@ class TestGitTargeted:
         src = inspect.getsource(mutate)
         assert "add -A" not in src, \
             "mutate.py 不得包含 git add -A"
+
+
+# --------------------------------------------------------------------------- #
+# Task 2: apply_patch（anchor 精确文本替换）                                    #
+# --------------------------------------------------------------------------- #
+
+_TSCN_SAMPLE = (
+    '[gd_scene load_steps=2 format=3]\n'
+    '\n'
+    '[node name="MidPlatform" type="StaticBody2D" parent="."]\n'
+    'position = Vector2(600, 40)\n'
+    'collision_layer = 1\n'
+    '\n'
+    '[node name="GoalFlag" type="Area2D" parent="."]\n'
+    'position = Vector2(1520, 0)\n'
+)
+
+
+def _write(tmp_path, name: str, text: str) -> str:
+    p = os.path.join(tmp_path, name)
+    with open(p, "w", encoding="utf-8") as f:
+        f.write(text)
+    return p
+
+
+def _init_tmp_git_repo_for_patch(base: str) -> str:
+    """复用 _init_tmp_git_repo 在 base 下建最小 git 仓。"""
+    return _init_tmp_git_repo(base)
+
+
+class TestApplyPatch:
+    """apply_patch(path, anchor, new, repo_root, protected_globs)。"""
+
+    def test_apply_patch_replaces_unique_anchor(self, tmp_path):
+        """唯一(多行)anchor → 替换为 new，仅该处变。"""
+        from mutate import apply_patch
+        repo = _init_tmp_git_repo_for_patch(str(tmp_path))
+        rel = "scene.tscn"
+        _write(repo, rel, _TSCN_SAMPLE)
+        anchor = (
+            '[node name="MidPlatform" type="StaticBody2D" parent="."]\n'
+            'position = Vector2(600, 40)'
+        )
+        new = (
+            '[node name="MidPlatform" type="StaticBody2D" parent="."]\n'
+            'position = Vector2(800, 40)'
+        )
+        apply_patch(rel, anchor, new, repo_root=repo)
+        with open(os.path.join(repo, rel), encoding="utf-8") as f:
+            out = f.read()
+        assert "Vector2(800, 40)" in out
+        # GoalFlag 的 position 不应被动到
+        assert "Vector2(1520, 0)" in out
+        # 只替换一次
+        assert out.count("MidPlatform") == 1
+
+    def test_apply_patch_rejects_missing_anchor(self, tmp_path):
+        """anchor 不存在 → ValueError，文件不变。"""
+        from mutate import apply_patch
+        repo = _init_tmp_git_repo_for_patch(str(tmp_path))
+        rel = "scene.tscn"
+        _write(repo, rel, _TSCN_SAMPLE)
+        with pytest.raises(ValueError, match="未命中"):
+            apply_patch(rel, "position = Vector2(999, 999)", "x", repo_root=repo)
+        with open(os.path.join(repo, rel), encoding="utf-8") as f:
+            assert f.read() == _TSCN_SAMPLE
+
+    def test_apply_patch_rejects_ambiguous_anchor(self, tmp_path):
+        """anchor 出现 2 次 → ValueError（歧义），文件不变。"""
+        from mutate import apply_patch
+        repo = _init_tmp_git_repo_for_patch(str(tmp_path))
+        rel = "scene.tscn"
+        dup = "position = Vector2(1, 1)\nposition = Vector2(1, 1)\n"
+        _write(repo, rel, dup)
+        with pytest.raises(ValueError, match="歧义"):
+            apply_patch(rel, "position = Vector2(1, 1)", "x", repo_root=repo)
+        with open(os.path.join(repo, rel), encoding="utf-8") as f:
+            assert f.read() == dup
+
+    def test_apply_patch_path_containment(self, tmp_path):
+        """仓外相对/绝对路径越界 → ValueError。"""
+        from mutate import apply_patch
+        repo = _init_tmp_git_repo_for_patch(str(tmp_path / "repo"))
+        with pytest.raises(ValueError):
+            apply_patch("../outside.tscn", "a", "b", repo_root=repo)
+        outside = str(tmp_path / "outside.tscn")
+        with pytest.raises(ValueError):
+            apply_patch(outside, "a", "b", repo_root=repo)
+
+    def test_apply_patch_missing_file_raises(self, tmp_path):
+        """path 不存在 → FileNotFoundError。"""
+        from mutate import apply_patch
+        repo = _init_tmp_git_repo_for_patch(str(tmp_path))
+        with pytest.raises(FileNotFoundError):
+            apply_patch("nonexistent.tscn", "a", "b", repo_root=repo)
+
+    def test_apply_patch_refuses_protected(self, tmp_path):
+        """protected_globs 命中目标路径 → ValueError，文件不变。"""
+        from mutate import apply_patch
+        repo = _init_tmp_git_repo_for_patch(str(tmp_path))
+        os.makedirs(os.path.join(repo, "testbed_platformer", "rl"), exist_ok=True)
+        rel = "testbed_platformer/rl/game_agent.gd"
+        content = "var GOAL_X = 1520\n"
+        _write(repo, rel, content)
+        with pytest.raises(ValueError):
+            apply_patch(
+                rel, "var GOAL_X = 1520", "var GOAL_X = 9999",
+                repo_root=repo, protected_globs=["*/rl/game_agent.gd"],
+            )
+        with open(os.path.join(repo, rel), encoding="utf-8") as f:
+            assert f.read() == content
+
+
+# --------------------------------------------------------------------------- #
+# Task 2: allowed() patches-aware protected guard                              #
+# --------------------------------------------------------------------------- #
+
+class TestAllowedPatches:
+    """allowed(plan, protected_globs, *, proj_rel=...) 遍历 patches。"""
+
+    _PROTECTED = [
+        "harness/**", ".git/**", "tests/**", "docs/**",
+        "*/rl/game_agent.gd", "*/rl/telemetry.gd", "*/rl/recorder.gd",
+    ]
+
+    def test_allowed_rejects_patch_touching_protected(self):
+        """structural patch 触碰 game_agent.gd → False。"""
+        from mutate import allowed
+        plan = {
+            "change_type": "structural",
+            "patches": [
+                {"file": "res://rl/game_agent.gd", "anchor": "a", "new": "b"},
+            ],
+        }
+        assert allowed(plan, self._PROTECTED, proj_rel="testbed_platformer") is False
+
+    def test_allowed_passes_legal_tscn_patch(self):
+        """合法 train_map.tscn patch → True。"""
+        from mutate import allowed
+        plan = {
+            "change_type": "structural",
+            "patches": [
+                {"file": "res://rl/train_map.tscn", "anchor": "a", "new": "b"},
+            ],
+        }
+        assert allowed(plan, self._PROTECTED, proj_rel="testbed_platformer") is True
+
+    def test_allowed_backward_compat_no_proj_rel(self):
+        """阶段1 向后兼容：不传 proj_rel 仍可用。"""
+        from mutate import allowed
+        plan = {"change_type": "tunable_search", "files": []}
+        assert allowed(plan, self._PROTECTED) is True
+
+
+# --------------------------------------------------------------------------- #
+# Task 2: target_files()                                                       #
+# --------------------------------------------------------------------------- #
+
+class TestTargetFiles:
+    """target_files(plan, *, proj_rel) → repo-relative 路径列表。"""
+
+    def test_target_files_maps_res_paths(self):
+        """res:// 映射 + 多 patch 同文件去重保序。"""
+        from mutate import target_files
+        plan = {
+            "change_type": "structural",
+            "patches": [
+                {"file": "res://rl/train_map.tscn", "anchor": "a", "new": "b"},
+                {"file": "res://rl/train_map.tscn", "anchor": "c", "new": "d"},
+            ],
+        }
+        assert target_files(plan, proj_rel="testbed_platformer") == [
+            "testbed_platformer/rl/train_map.tscn"
+        ]
+
+    def test_target_files_rejects_escape(self):
+        """含 .. 段或越出 proj 的 res:// 路径 → ValueError。"""
+        from mutate import target_files
+        plan = {
+            "change_type": "structural",
+            "patches": [
+                {"file": "res://../../harness/x.py", "anchor": "a", "new": "b"},
+            ],
+        }
+        with pytest.raises(ValueError):
+            target_files(plan, proj_rel="testbed_platformer")
+
+    def test_target_files_tunable_search(self):
+        """tunable_search 计划：本函数不解析 tunables，返回空列表。"""
+        from mutate import target_files
+        plan = {"change_type": "tunable_search", "files": []}
+        assert target_files(plan, proj_rel="testbed_platformer") == []
