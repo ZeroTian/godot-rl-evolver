@@ -43,7 +43,12 @@ import evaluation
 # 配置                                                                          #
 # --------------------------------------------------------------------------- #
 
-DEFAULT_PROTECTED = "harness/**,.git/**,tests/**,docs/**"
+# 默认 protected glob:除工具链/仓基础设施外,**点名测量装置文件**(critic C2)。
+# game_agent.gd 含 GOAL_X/FALL_Y/reward,telemetry.gd/recorder.gd 是落盘装置——
+# 这些是「尺子」,structural patch 绝不能碰。因目标游戏各异,须显式点名该游戏的测量文件。
+DEFAULT_PROTECTED = (
+    "harness/**,.git/**,tests/**,docs/**,"
+    "*/rl/game_agent.gd,*/rl/telemetry.gd,*/rl/recorder.gd")
 
 # 阶段1 唯一可提交的白名单路径(repo-relative)。结构/逻辑改动属阶段 2/3,
 # 阶段1 只允许写真实玩法参数,提交粒度固定到这一个文件。
@@ -110,6 +115,9 @@ class Config:
         self.max_eval_steps = _env_int("MAX_EVAL_STEPS", 40000)
         self.eval_timeout_seconds = _env_int("EVAL_TIMEOUT_SECONDS", 900)
         self.min_improvement = _env_float("MIN_IMPROVEMENT", 0.1)
+        # smoke gate 预算(阶段2):廉价跑一局确认场景能起;独立于正式评估预算。
+        self.smoke_max_steps = _env_int("SMOKE_MAX_STEPS", 2000)
+        self.smoke_timeout_seconds = _env_int("SMOKE_TIMEOUT_SECONDS", 120)
         self.artifact_root = os.environ.get(
             "ARTIFACT_ROOT", os.path.join(".artifacts", "opt"))
         # 本次 run 的唯一 id(run_optimize.sh 注入)。用于把每次 run 的 artifact 目录隔离到
@@ -212,7 +220,9 @@ def has_high_issue(report: dict) -> bool:
 # 独立 artifact + 配对评估器(spec §5.5,Task 4)                                #
 # --------------------------------------------------------------------------- #
 
-def run_one_seed(cfg: Config, *, seed: int, artifact_dir: str) -> evaluation.RunResult:
+def run_one_seed(cfg: Config, *, seed: int, artifact_dir: str,
+                 min_episodes: int | None = None,
+                 max_eval_steps: int | None = None) -> evaluation.RunResult:
     """对单个 seed 在隔离目录里跑一次试玩并诊断,返回进程绑定的 RunResult。
 
     步骤(spec §5.5 / 原则 7):
@@ -223,7 +233,16 @@ def run_one_seed(cfg: Config, *, seed: int, artifact_dir: str) -> evaluation.Run
       ④ 结束后要求 telemetry 目录中**恰好一个** run_*.jsonl(0/多个均失败);
       ⑤ 调 evaluation.validate_telemetry() 诊断**那个确切文件**,禁止搜索别处;
       ⑥ 用 objective.score 算分,返回带启动前 hash 的 RunResult。
+
+    预算覆盖(critic C3,smoke_gate 复用):
+      min_episodes / max_eval_steps 默认 None → 用 cfg.eval_episodes / cfg.max_eval_steps
+      (阶段1 零回归)。覆盖值同时作用于:传给子进程的 EVAL_EPISODES / MAX_EVAL_STEPS
+      与 validate_telemetry 的 min_episodes。smoke_gate 传 min_episodes=1 得廉价 ≥1 局评估。
     """
+    eff_episodes = (min_episodes if min_episodes is not None
+                    else cfg.eval_episodes)
+    eff_max_steps = (max_eval_steps if max_eval_steps is not None
+                     else cfg.max_eval_steps)
     # ① 隔离目录:已存在即拒绝,避免复用旧产物(原则 7 反对回退 latest)。
     if os.path.exists(artifact_dir):
         raise FileExistsError(f"artifact_dir 已存在,拒绝复用: {artifact_dir}")
@@ -243,8 +262,8 @@ def run_one_seed(cfg: Config, *, seed: int, artifact_dir: str) -> evaluation.Run
         "DIAGNOSE": "0",
         "TELEMETRY_DIR": telemetry_dir,
         "EVAL_SEED": str(seed),
-        "EVAL_EPISODES": str(cfg.eval_episodes),
-        "MAX_EVAL_STEPS": str(cfg.max_eval_steps),
+        "EVAL_EPISODES": str(eff_episodes),
+        "MAX_EVAL_STEPS": str(eff_max_steps),
         "PROJ": cfg.proj,
         "SCENE": cfg.scene,
         "MODEL": cfg.model,
@@ -280,7 +299,7 @@ def run_one_seed(cfg: Config, *, seed: int, artifact_dir: str) -> evaluation.Run
     report, run_id = evaluation.validate_telemetry(
         telemetry_path,
         scene=cfg.scene, model=cfg.model, speedup=cfg.speedup,
-        min_episodes=cfg.eval_episodes, thresholds=cfg.thresholds)
+        min_episodes=eff_episodes, thresholds=cfg.thresholds)
 
     # ⑥ 算分 + 组 provenance(hash 来自启动前)。
     sc = objective.score(report, target=cfg.target_completion)
@@ -348,6 +367,8 @@ def optimize_loop(
     evaluator_fn: Optional[Callable] = None,
     baseline_fn: Optional[Callable] = None,
     tracked_changes_fn: Optional[Callable] = None,
+    syntax_gate_fn: Optional[Callable] = None,
+    smoke_gate_fn: Optional[Callable] = None,
 ) -> dict:
     """运行优化闭环(spec §7 主循环 + §6 三道 gate),返回总结 dict。
 
@@ -379,13 +400,18 @@ def optimize_loop(
 
     propose_fn = propose_fn or (
         lambda report, tunables, mem, stage: llm_propose.propose(
-            report, tunables, mem, stage
+            report, tunables, mem, stage, code_summary=_code_summary(cfg)
         )
     )
     evaluator_fn = evaluator_fn or make_evaluator(cfg)
     baseline_fn = baseline_fn or (
         lambda c: evaluate_current(c, point_id="baseline"))
     tracked_changes_fn = tracked_changes_fn or _default_tracked_changes
+    # gate 默认实现:函数体内局部 import gates,避免 optimize↔gates 顶层循环(critic M3)。
+    if syntax_gate_fn is None or smoke_gate_fn is None:
+        import gates
+        syntax_gate_fn = syntax_gate_fn or gates.syntax_gate
+        smoke_gate_fn = smoke_gate_fn or gates.smoke_gate
 
     mem_path = _memory_path_for(cfg)
 
@@ -418,7 +444,9 @@ def optimize_loop(
         plan = propose_fn(report, tunables, mem, cfg.stage)
 
         # protected + 参数边界入口:命中则拒绝并记 memory(不快照/不搜索)。
-        if not mutate.allowed(plan, cfg.protected_paths):
+        # proj_rel 让 structural 的 patches(res://)经映射后也过 protected 检查
+        # (防御纵深第②层,critic C1/M4)。
+        if not mutate.allowed(plan, cfg.protected_paths, proj_rel=_proj_rel(cfg)):
             memory_mod.add_round(
                 mem_path, cfg.scene,
                 _record(r, plan, base.mean_score, base.mean_score, False,
@@ -427,14 +455,38 @@ def optimize_loop(
             no_improve += 1
             continue
 
-        # 本轮白名单:阶段1 固定为唯一的 tunables.json(repo-relative)。
-        paths = [STAGE1_TUNABLES_REL]
-        snap = mutate.snapshot(paths, cfg.repo_root)
-
         change_type = plan.get("change_type")
+
+        # 本轮白名单:tunable_search 仍恰为唯一的 tunables.json(repo-relative,
+        # 阶段1 提交粒度不变,critic M2);structural/logic 取 plan 声明的目标文件集。
+        if change_type == "tunable_search":
+            paths = [STAGE1_TUNABLES_REL]
+        else:
+            try:
+                paths = mutate.target_files(plan, proj_rel=_proj_rel(cfg))
+            except ValueError as e:
+                memory_mod.add_round(
+                    mem_path, cfg.scene,
+                    _record(r, plan, base.mean_score, base.mean_score, False,
+                            "invalid patch path: %s" % e),
+                )
+                no_improve += 1
+                continue
+
+        # ── structural 分支(stage>=2):无贝叶斯,四步 gate ──────────────────
+        if change_type == "structural" and cfg.stage >= 2:
+            base, accepted_rec = _run_structural_round(
+                cfg, plan, paths, r, base, mem_path,
+                syntax_gate_fn, smoke_gate_fn)
+            if accepted_rec is not None:
+                accepted.append(accepted_rec)
+                no_improve = 0
+            else:
+                no_improve += 1
+            continue
+
         if change_type != "tunable_search":
-            # 阶段 2/3:structural / logic。阶段1不处理 → 定向回滚跳过。
-            mutate.rollback(snap, cfg.repo_root)
+            # 阶段不支持的 change_type(如 stage<2 的 structural、logic)→ 跳过。
             memory_mod.add_round(
                 mem_path, cfg.scene,
                 _record(r, plan, base.mean_score, base.mean_score, False,
@@ -442,6 +494,9 @@ def optimize_loop(
             )
             no_improve += 1
             continue
+
+        # tunable_search:快照白名单,跑贝叶斯内循环。
+        snap = mutate.snapshot(paths, cfg.repo_root)
 
         # 贝叶斯内循环:返回最优点 + 对应 candidate(EvaluationResult)。
         # 评估失败(0/多个 JSONL、局数不足、超时等)会从 evaluator 抛出 → 记失败回滚。
@@ -520,13 +575,18 @@ def _memory_path_for(cfg: Config) -> str:
     return os.path.join(mem_dir, "%s.json" % _scene_hash(cfg.scene))
 
 
-def _default_tracked_changes(cfg: Config) -> list:
-    """Gate 0b 默认实现:列出工作树里白名单之外的 tracked 改动路径。
+def _default_tracked_changes(cfg: Config, paths: list | None = None) -> list:
+    """Gate 0b 默认实现:列出工作树里**当轮白名单**之外的 tracked 改动路径。
 
-    用 `git status --porcelain` 取改动文件,过滤掉阶段1 白名单与被忽略的
-    `.artifacts/`。任何残留(代码/场景/其它 tracked)即视为越界,返回非空。
+    用 `git status --porcelain` 取改动文件,放行集 = 当轮 paths 白名单 + `.artifacts/`
+    (critic M2:取当轮,不累积,避免历史白名单永久放行而侵蚀边界)。任何残留(代码/
+    场景/其它 tracked)即视为越界,返回非空。
+
+    paths 缺省(None)时放行集回退到阶段1 唯一白名单 `[STAGE1_TUNABLES_REL]`,
+    供循环开头 Gate 0b 单参调用(此时尚无当轮 plan)使用。
     失败(非 git 仓等)时返回空,交由上层默认放行(单测均显式注入此钩子)。
     """
+    whitelist = set(paths) if paths is not None else {STAGE1_TUNABLES_REL}
     try:
         out = subprocess.run(
             ["git", "status", "--porcelain"],
@@ -540,7 +600,7 @@ def _default_tracked_changes(cfg: Config) -> list:
         if not line.strip():
             continue
         path = line[3:].strip()
-        if path == STAGE1_TUNABLES_REL:
+        if path in whitelist:
             continue
         if path.startswith(".artifacts/"):
             continue
@@ -566,6 +626,106 @@ def _record(round_idx, plan, score_before, score_after, accepted, reason) -> dic
     }
 
 
+def _proj_rel(cfg: Config) -> str:
+    """PROJ 相对 repo_root 的路径,用于 res:// → repo-relative 映射(critic C1/M5)。
+
+    cfg.proj 为空(纯 tunable_search 场景未设 PROJ)时返回空串,_res_to_repo 退化为
+    按原样路径匹配,不影响阶段1。
+    """
+    if not cfg.proj:
+        return ""
+    return os.path.relpath(cfg.proj, cfg.repo_root)
+
+
+def apply_structural(cfg: Config, plan: dict, paths: list) -> None:
+    """逐条 mutate.apply_patch 应用 plan['patches'](res:// 映射成 repo 路径)。
+
+    每条 patch 把 cfg.protected_paths 透传给 apply_patch 的 protected_globs
+    (防御纵深第③层,写文件前再拦一次)。anchor 未命中/歧义、路径越界、命中 protected
+    都从 apply_patch 抛 ValueError,由调用方捕获并定向回滚。
+    """
+    pr = _proj_rel(cfg)
+    for patch in plan.get("patches") or []:
+        repo_rel = mutate._res_to_repo(patch["file"], pr)
+        mutate.apply_patch(
+            repo_rel, patch["anchor"], patch["new"], cfg.repo_root,
+            protected_globs=cfg.protected_paths)
+
+
+def _run_structural_round(cfg, plan, paths, r, base, mem_path,
+                          syntax_gate_fn, smoke_gate_fn):
+    """structural 一轮:snapshot→apply→语法 gate→smoke gate→指标回归。
+
+    返回 (new_base, accepted_record):
+      - 接受:new_base=candidate,accepted_record=dict;
+      - 拒绝/失败:new_base=base(不变),accepted_record=None(均已记 memory + 回滚)。
+    无贝叶斯内循环(patch 是离散文本操作,一次提案=一个候选)。
+    """
+    snap = mutate.snapshot(paths, cfg.repo_root)
+
+    # ① 应用 patch(anchor/protected/越界异常 → 回滚)
+    try:
+        apply_structural(cfg, plan, paths)
+    except (ValueError, FileNotFoundError) as e:
+        mutate.rollback(snap, cfg.repo_root)
+        memory_mod.add_round(
+            mem_path, cfg.scene,
+            _record(r, plan, base.mean_score, base.mean_score, False,
+                    "apply failed: %s" % e))
+        return base, None
+
+    # ② 语法 gate(Godot --import)
+    ok, detail = syntax_gate_fn(cfg)
+    if not ok:
+        mutate.rollback(snap, cfg.repo_root)
+        memory_mod.add_round(
+            mem_path, cfg.scene,
+            _record(r, plan, base.mean_score, base.mean_score, False,
+                    "syntax: %s" % detail))
+        return base, None
+
+    # ③ smoke gate(≥1 episode)
+    ok, detail = smoke_gate_fn(cfg)
+    if not ok:
+        mutate.rollback(snap, cfg.repo_root)
+        memory_mod.add_round(
+            mem_path, cfg.scene,
+            _record(r, plan, base.mean_score, base.mean_score, False,
+                    "smoke: %s" % detail))
+        return base, None
+
+    # ④ 指标回归:配对改善 > min_improvement 才接受
+    try:
+        candidate = evaluate_current(cfg, point_id="structural_r%d" % r)
+        improvement = evaluation.paired_improvement(base, candidate)
+    except (RuntimeError, ValueError) as e:
+        mutate.rollback(snap, cfg.repo_root)
+        memory_mod.add_round(
+            mem_path, cfg.scene,
+            _record(r, plan, base.mean_score, base.mean_score, False,
+                    "evaluation failed: %s" % e))
+        return base, None
+
+    if improvement > cfg.min_improvement:
+        prev = base.mean_score
+        mutate.commit("opt r%d: structural %s" % (r, plan.get("target_issue", "")),
+                      paths, cfg.repo_root)
+        after = candidate.mean_score
+        memory_mod.add_round(
+            mem_path, cfg.scene,
+            _record(r, plan, prev, after, True,
+                    "score %.3f→%.3f" % (prev, after)))
+        return candidate, {"round": r, "summary": "structural",
+                           "score_before": prev, "score_after": after}
+
+    mutate.rollback(snap, cfg.repo_root)
+    memory_mod.add_round(
+        mem_path, cfg.scene,
+        _record(r, plan, base.mean_score, candidate.mean_score, False,
+                "no score improvement"))
+    return base, None
+
+
 def _normalize_search_space(search_space: list, tunables: dict) -> list:
     """把 LLM 的 search_space([{key,range}])补上 type(从 tunables 读),供 search 用。"""
     params = tunables.get("params", {})
@@ -579,6 +739,29 @@ def _normalize_search_space(search_space: list, tunables: dict) -> list:
 
 def _summarize_point(point: dict) -> str:
     return ", ".join(f"{k}={v}" for k, v in point.items())
+
+
+# 阶段2 结构旋钮：测试床 train_map.tscn 里唯一可 patch 的 MidPlatform position。
+# anchor 取「节点声明行 + position 行」多行块,保证文件内唯一可定位(critic M1)。
+_MIDPLATFORM_ANCHOR = (
+    '[node name="MidPlatform" type="StaticBody2D" parent="."]\n'
+    "position = Vector2(600, 40)")
+
+
+def _code_summary(cfg: Config) -> str:
+    """阶段2≥ 喂给 LLM 的结构摘要:可 patch 的 anchor + 硬边界指引。
+
+    阶段1(stage<2)返回空串 → propose prompt 零回归。stage>=2 时给出 MidPlatform
+    的 anchor 多行块,并明确只准挪其 position、禁碰 GoalFlag/GOAL/FALL/reward。
+    """
+    if cfg.stage < 2:
+        return ""
+    return (
+        "目标文件: res://rl/train_map.tscn\n"
+        "可 patch 的 anchor(必须原样作为 patch.anchor,含节点声明行+position 行):\n"
+        + _MIDPLATFORM_ANCHOR + "\n"
+        "改动指引: 只准挪 MidPlatform 的 position(踏脚石平台位置),"
+        "禁止碰 GoalFlag/GOAL/FALL/reward 与 telemetry/诊断装置。")
 
 
 def print_summary(summary: dict) -> None:

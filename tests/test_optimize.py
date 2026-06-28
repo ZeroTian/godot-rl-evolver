@@ -97,7 +97,9 @@ def _patch_git(monkeypatch):
         return {"SNAP": b""}
 
     monkeypatch.setattr(mutate, "snapshot", _snap)
-    monkeypatch.setattr(mutate, "allowed", lambda plan, protected: True)
+    # allowed 被 optimize_loop 以 proj_rel= kwarg 调用(阶段2),mock 须兼容 kwarg。
+    monkeypatch.setattr(mutate, "allowed",
+                        lambda plan, protected, *, proj_rel="": True)
     monkeypatch.setattr(mutate, "apply_tunable", lambda path, k, v: None)
     monkeypatch.setattr(mutate, "rollback",
                         lambda snap, repo_root=".": calls.__setitem__(
@@ -558,6 +560,51 @@ def test_run_one_seed_requires_exactly_one_new_jsonl(tmp_path, monkeypatch):
     assert rr.telemetry_path.endswith("run_0.jsonl")
 
 
+def test_run_one_seed_honors_episode_and_step_overrides(tmp_path, monkeypatch):
+    """run_one_seed 传 min_episodes/max_eval_steps 覆盖时,透传给子进程的
+    EVAL_EPISODES/MAX_EVAL_STEPS 与 validate_telemetry 的 min_episodes 都用覆盖值;
+    不传则用 cfg 默认(阶段1 零回归,critic C3)。"""
+    cfg = _eval_cfg(tmp_path)         # cfg.eval_episodes=2, cfg.max_eval_steps=5000
+    captured = {"env": None, "min_episodes": None}
+
+    def _fake_run(cmd, **kwargs):
+        env = kwargs.get("env", {})
+        captured["env"] = dict(env)
+        tdir = env["TELEMETRY_DIR"]
+        _make_telemetry(os.path.join(tdir, "run_0.jsonl"),
+                        scene=cfg.scene, model=cfg.model, speedup=cfg.speedup,
+                        n_episodes=3, run_id="RID")
+
+        class R:
+            returncode = 0
+            stdout = ""
+            stderr = ""
+        return R()
+
+    def _fake_validate(path, *, scene, model, speedup, min_episodes, thresholds=None):
+        captured["min_episodes"] = min_episodes
+        return ({"summary": {"n_episodes": 3, "completion_rate": 0.5},
+                 "issues": [], "run_id": "RID"}, "RID")
+
+    monkeypatch.setattr(optimize.subprocess, "run", _fake_run)
+    monkeypatch.setattr(optimize.evaluation, "validate_telemetry", _fake_validate)
+
+    # 覆盖:min_episodes=1, max_eval_steps=999
+    optimize.run_one_seed(cfg, seed=1, artifact_dir=str(tmp_path / "art_override"),
+                          min_episodes=1, max_eval_steps=999)
+    assert captured["env"]["EVAL_EPISODES"] == "1"
+    assert captured["env"]["MAX_EVAL_STEPS"] == "999"
+    assert captured["min_episodes"] == 1
+
+    # 不覆盖:用 cfg 默认值(零回归)
+    captured["env"] = None
+    captured["min_episodes"] = None
+    optimize.run_one_seed(cfg, seed=2, artifact_dir=str(tmp_path / "art_default"))
+    assert captured["env"]["EVAL_EPISODES"] == str(cfg.eval_episodes)
+    assert captured["env"]["MAX_EVAL_STEPS"] == str(cfg.max_eval_steps)
+    assert captured["min_episodes"] == cfg.eval_episodes
+
+
 def test_run_one_seed_rejects_existing_artifact_dir(tmp_path, monkeypatch):
     """artifact_dir 已存在 → 拒绝(避免复用旧产物)。"""
     cfg = _eval_cfg(tmp_path)
@@ -628,6 +675,236 @@ def test_evaluate_current_isolates_artifact_dir_by_run_id(tmp_path, monkeypatch)
     optimize.evaluate_current(cfg, point_id="baseline")
     assert "RUN_ABC" in captured[0]
     assert captured[0].endswith(os.path.join("RUN_ABC", "baseline", "seed_1"))
+
+
+# ─────────────────────────────────────────────────────────────────────
+# Task 5: structural 分支 + 白名单泛化 + Gate0b 防回归 + PROTECTED 默认
+# 全用注入的假 propose/evaluator/gate 钩子,不起 Godot。
+# ─────────────────────────────────────────────────────────────────────
+
+_TRAIN_MAP_REL = "testbed_platformer/rl/train_map.tscn"
+
+_STRUCT_PLAN = {
+    "change_type": "structural",
+    "target_issue": "difficulty_too_hard",
+    "patches": [{
+        "file": "res://rl/train_map.tscn",
+        "anchor": '[node name="MidPlatform" type="StaticBody2D" parent="."]\n'
+                  "position = Vector2(600, 40)",
+        "new": '[node name="MidPlatform" type="StaticBody2D" parent="."]\n'
+               "position = Vector2(700, 40)",
+    }],
+    "expected_effect": "挪踏脚石平台降低难度",
+}
+
+
+def _struct_cfg(tmp_path):
+    """stage=2 structural 用 Config:proj 是 repo 子目录(proj_rel=testbed_platformer)。"""
+    cfg = _loop_cfg(tmp_path)
+    cfg.stage = 2
+    cfg.proj = os.path.join(str(tmp_path), "testbed_platformer")
+    return cfg
+
+
+def _patch_apply(monkeypatch):
+    """mock mutate.apply_patch(structural 不真改文件),记调用。"""
+    calls = []
+
+    def _ap(path, anchor, new, repo_root=".", protected_globs=None):
+        calls.append({"path": path, "anchor": anchor, "new": new,
+                      "protected_globs": protected_globs})
+
+    monkeypatch.setattr(mutate, "apply_patch", _ap)
+    return calls
+
+
+def test_structural_accept_commits_patched_tscn(tmp_path, monkeypatch):
+    """structural 接受 → commit 收到的 paths 恰为被 patch 的 train_map.tscn。"""
+    cfg = _struct_cfg(tmp_path)
+    calls = _patch_git(monkeypatch)
+    _patch_apply(monkeypatch)
+    monkeypatch.setattr(optimize, "evaluate_current",
+                        lambda c, *, point_id: _eval_result(mean=1.0))
+
+    summary = optimize.optimize_loop(
+        cfg,
+        propose_fn=lambda rep, tun, mem, stage: _STRUCT_PLAN,
+        baseline_fn=lambda c: _eval_result(mean=5.0),
+        syntax_gate_fn=lambda c: (True, "ok"),
+        smoke_gate_fn=lambda c: (True, "ok"),
+        tracked_changes_fn=lambda c: [],
+    )
+
+    assert len(calls["commit"]) == 1
+    assert calls["commit"][0] == [_TRAIN_MAP_REL]
+    assert len(summary["accepted"]) == 1
+
+
+def test_structural_rejected_when_patch_touches_protected(tmp_path, monkeypatch):
+    """注入触碰 game_agent.gd 的 patch(绕过 parse_plan)→ mutate.allowed 在 snapshot
+    前拒绝,记 "protected path",不 apply/不 commit(critic C1/M4 第②层)。
+
+    此用例**不** mock mutate.allowed,用真实实现验证第②层确实拦下;仅 mock 不应被
+    触达的 snapshot/rollback/commit/apply_patch 以捕获是否被错误调用。
+    """
+    cfg = _struct_cfg(tmp_path)
+    # 默认 protected_paths 含 */rl/game_agent.gd,真实 allowed 应拦下
+    cfg.protected_paths = list(optimize.DEFAULT_PROTECTED.split(","))
+
+    calls = {"snapshot": [], "rollback": 0, "commit": []}
+    monkeypatch.setattr(mutate, "snapshot",
+                        lambda paths, repo_root=".": calls["snapshot"].append(
+                            list(paths)) or {"SNAP": b""})
+    monkeypatch.setattr(mutate, "rollback",
+                        lambda snap, repo_root=".": calls.__setitem__(
+                            "rollback", calls["rollback"] + 1))
+    monkeypatch.setattr(mutate, "commit",
+                        lambda msg, paths, repo_root=".": calls["commit"].append(
+                            list(paths)))
+    apply_calls = _patch_apply(monkeypatch)
+    monkeypatch.setattr(optimize, "evaluate_current",
+                        lambda c, *, point_id: pytest.fail("不应评估"))
+
+    bad_plan = {
+        "change_type": "structural",
+        "target_issue": "x",
+        "patches": [{"file": "res://rl/game_agent.gd",
+                     "anchor": "a", "new": "b"}],
+        "expected_effect": "y",
+    }
+
+    summary = optimize.optimize_loop(
+        cfg,
+        propose_fn=lambda rep, tun, mem, stage: bad_plan,
+        baseline_fn=lambda c: _eval_result(mean=5.0),
+        syntax_gate_fn=lambda c: pytest.fail("不应过 gate"),
+        smoke_gate_fn=lambda c: pytest.fail("不应过 gate"),
+        tracked_changes_fn=lambda c: [],
+    )
+
+    assert calls["commit"] == []
+    assert calls["snapshot"] == []           # 命中 protected → 不快照
+    assert apply_calls == []                  # 不 apply
+    mem = _read_mem(cfg)
+    assert "protected" in mem["rounds"][0]["reason"]
+
+
+def test_structural_syntax_gate_failure_rolls_back(tmp_path, monkeypatch):
+    cfg = _struct_cfg(tmp_path)
+    calls = _patch_git(monkeypatch)
+    _patch_apply(monkeypatch)
+    monkeypatch.setattr(optimize, "evaluate_current",
+                        lambda c, *, point_id: pytest.fail("syntax 不过不应评估"))
+
+    summary = optimize.optimize_loop(
+        cfg,
+        propose_fn=lambda rep, tun, mem, stage: _STRUCT_PLAN,
+        baseline_fn=lambda c: _eval_result(mean=5.0),
+        syntax_gate_fn=lambda c: (False, "SCRIPT ERROR: boom"),
+        smoke_gate_fn=lambda c: (True, "ok"),
+        tracked_changes_fn=lambda c: [],
+    )
+
+    assert calls["rollback"] == 1
+    assert calls["commit"] == []
+    mem = _read_mem(cfg)
+    assert "syntax" in mem["rounds"][0]["reason"]
+
+
+def test_structural_smoke_gate_failure_rolls_back(tmp_path, monkeypatch):
+    cfg = _struct_cfg(tmp_path)
+    calls = _patch_git(monkeypatch)
+    _patch_apply(monkeypatch)
+    monkeypatch.setattr(optimize, "evaluate_current",
+                        lambda c, *, point_id: pytest.fail("smoke 不过不应评估"))
+
+    summary = optimize.optimize_loop(
+        cfg,
+        propose_fn=lambda rep, tun, mem, stage: _STRUCT_PLAN,
+        baseline_fn=lambda c: _eval_result(mean=5.0),
+        syntax_gate_fn=lambda c: (True, "ok"),
+        smoke_gate_fn=lambda c: (False, "no episode"),
+        tracked_changes_fn=lambda c: [],
+    )
+
+    assert calls["rollback"] == 1
+    assert calls["commit"] == []
+    mem = _read_mem(cfg)
+    assert "smoke" in mem["rounds"][0]["reason"]
+
+
+def test_structural_no_improvement_rolls_back(tmp_path, monkeypatch):
+    cfg = _struct_cfg(tmp_path)
+    calls = _patch_git(monkeypatch)
+    _patch_apply(monkeypatch)
+    # 两 gate 过,但 candidate 不够好(改善 0.05 < 0.1)
+    monkeypatch.setattr(optimize, "evaluate_current",
+                        lambda c, *, point_id: _eval_result(mean=4.95))
+
+    summary = optimize.optimize_loop(
+        cfg,
+        propose_fn=lambda rep, tun, mem, stage: _STRUCT_PLAN,
+        baseline_fn=lambda c: _eval_result(mean=5.0),
+        syntax_gate_fn=lambda c: (True, "ok"),
+        smoke_gate_fn=lambda c: (True, "ok"),
+        tracked_changes_fn=lambda c: [],
+    )
+
+    assert calls["rollback"] == 1
+    assert calls["commit"] == []
+    assert summary["accepted"] == []
+    mem = _read_mem(cfg)
+    assert "no score improvement" in mem["rounds"][0]["reason"]
+
+
+def test_tunable_whitelist_unchanged(tmp_path, monkeypatch):
+    """tunable_search 下 paths 恰为 [STAGE1_TUNABLES_REL](白名单泛化不改阶段1 粒度)。"""
+    cfg = _loop_cfg(tmp_path)
+    calls = _patch_git(monkeypatch)
+
+    monkeypatch.setattr(search, "optimize",
+                        lambda space, ev, n_calls: ({"enemy_hp": 30},
+                                                    _eval_result(mean=1.0)))
+
+    optimize.optimize_loop(
+        cfg,
+        propose_fn=lambda rep, tun, mem, stage: _PLAN,
+        baseline_fn=lambda c: _eval_result(mean=5.0),
+        evaluator_fn=lambda point: _eval_result(mean=1.0),
+        tracked_changes_fn=lambda c: [],
+    )
+
+    assert calls["snapshot"] == [[optimize.STAGE1_TUNABLES_REL]]
+    assert calls["commit"] == [[optimize.STAGE1_TUNABLES_REL]]
+
+
+def test_default_tracked_changes_real_impl(tmp_path):
+    """不注入 tracked_changes_fn:临时 git 仓,仅 tunables 脏→空;别的文件脏→非空。"""
+    import subprocess as sp
+    repo = tmp_path / "repo"
+    (repo / "testbed_platformer" / "rl").mkdir(parents=True)
+    sp.run(["git", "init", "-q"], cwd=repo, check=True)
+    sp.run(["git", "config", "user.email", "t@t"], cwd=repo, check=True)
+    sp.run(["git", "config", "user.name", "t"], cwd=repo, check=True)
+    tun = repo / optimize.STAGE1_TUNABLES_REL
+    tun.write_text('{"v":1}', encoding="utf-8")
+    other = repo / "testbed_platformer" / "rl" / "train_map.tscn"
+    other.write_text("x", encoding="utf-8")
+    sp.run(["git", "add", "-A"], cwd=repo, check=True)
+    sp.run(["git", "commit", "-qm", "init"], cwd=repo, check=True)
+
+    cfg = optimize.Config()
+    cfg.repo_root = str(repo)
+
+    # 仅 tunables 脏 → 当轮白名单放行 → 空
+    tun.write_text('{"v":2}', encoding="utf-8")
+    assert optimize._default_tracked_changes(cfg, [optimize.STAGE1_TUNABLES_REL]) == []
+
+    # 另一文件也脏,但不在当轮白名单 → 非空
+    other.write_text("y", encoding="utf-8")
+    outside = optimize._default_tracked_changes(cfg, [optimize.STAGE1_TUNABLES_REL])
+    assert outside  # 非空,含 train_map.tscn
+    assert any("train_map.tscn" in p for p in outside)
 
 
 def _variance(xs):

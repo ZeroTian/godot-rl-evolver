@@ -35,6 +35,7 @@ harness/llm_propose.py — LLM 提案解析与生成
 """
 from __future__ import annotations
 
+import fnmatch
 import json
 import os
 import shutil
@@ -67,6 +68,17 @@ MAX_RETRIES = 3
 
 # 禁用前缀：这些前缀的参数禁止进入 tunables（防误配置第二道保险）
 _BANNED_PREFIXES = ("reward_", "goal_", "fall_", "telemetry_", "diagnose_")
+
+# structural/logic patch 的 file 不得命中的 protected glob（阶段2 测量边界第①层，
+# critic C1/M4）。这是三层防御中的最外层：parse_plan 校验 LLM 提案；真正兜底在
+# mutate.allowed（第②层）与 apply_patch（第③层），因为 TDD 注入的 propose_fn 会绕过
+# 本函数。glob 对 res:// 去前缀后的相对路径匹配（含 '..' 穿越也覆盖）。
+_PATCH_PROTECTED_GLOBS = (
+    "harness/**", "harness/*", ".git/**", "tests/**", "docs/**",
+    "*/rl/game_agent.gd", "*/rl/telemetry.gd", "*/rl/recorder.gd",
+    "rl/game_agent.gd", "rl/telemetry.gd", "rl/recorder.gd",
+    "*game_agent.gd",
+)
 
 # 改动计划的 tool schema（用于 anthropic structured output）
 _PLAN_TOOL = {
@@ -186,6 +198,22 @@ def parse_plan(text: str, tunables: dict, stage: int = 1) -> dict:
             f"当前阶段只允许：{sorted(allowed_types)}"
         )
 
+    # 4b. structural/logic：校验 patches（阶段2 测量边界第①层，critic C1/M4）。
+    if change_type in {"structural", "logic"}:
+        patches = plan.get("patches")
+        if not patches or not isinstance(patches, list):
+            raise ValueError(
+                f"change_type=={change_type} 时 patches 不能为空")
+        for i, patch in enumerate(patches):
+            if not isinstance(patch, dict):
+                raise ValueError(f"patches[{i}] 必须是 object")
+            for k in ("file", "anchor", "new"):
+                v = patch.get(k)
+                if not isinstance(v, str) or not v:
+                    raise ValueError(
+                        f"patches[{i}] 缺少非空字符串字段 {k!r}")
+            _reject_protected_patch_file(patch["file"], i)
+
     # 5. tunable_search：校验 search_space
     if change_type == "tunable_search":
         search_space = plan.get("search_space")
@@ -247,6 +275,30 @@ def parse_plan(text: str, tunables: dict, stage: int = 1) -> dict:
     return plan
 
 
+def _reject_protected_patch_file(file: str, idx: int) -> None:
+    """structural/logic patch 的 file 命中测量边界即拒（第①层硬护栏，critic C1/M4）。
+
+    规则（任一命中即拒）：
+      - 去 res:// 前缀后含 '..' 段（路径穿越，可能逃出项目目录碰 harness/ 等）。
+      - 命中 _PATCH_PROTECTED_GLOBS 任一。
+      - basename 是测量装置文件（game_agent.gd / telemetry.gd / recorder.gd），
+        无论它在哪个目录，都不准作为结构旋钮。
+    """
+    rel = file[len("res://"):] if file.startswith("res://") else file
+    rel = rel.replace(os.sep, "/")
+    if ".." in rel.split("/"):
+        raise ValueError(
+            f"patches[{idx}].file 含 '..' 段，疑似路径穿越，拒绝: {file!r}")
+    base = rel.rsplit("/", 1)[-1]
+    if base in {"game_agent.gd", "telemetry.gd", "recorder.gd"}:
+        raise ValueError(
+            f"patches[{idx}].file 指向测量装置文件 {base!r}，禁止作为结构/逻辑旋钮: {file!r}")
+    for pattern in _PATCH_PROTECTED_GLOBS:
+        if fnmatch.fnmatch(rel, pattern):
+            raise ValueError(
+                f"patches[{idx}].file 命中 protected glob {pattern!r}，拒绝: {file!r}")
+
+
 # ---------------------------------------------------------------------------
 # propose — 组 prompt + 调 LLM + 重试
 # ---------------------------------------------------------------------------
@@ -257,6 +309,7 @@ def propose(
     memory: dict,
     stage: int = 1,
     max_retries: int = MAX_RETRIES,
+    code_summary: str = "",
 ) -> dict:
     """
     向 Claude API 提交优化请求，返回解析后的改动计划。
@@ -280,7 +333,7 @@ def propose(
         ValueError: 超过重试上限仍无法得到合法计划。
         RuntimeError: 无可用后端（既无 ANTHROPIC_API_KEY 也无 claude CLI）。
     """
-    prompt = _build_prompt(report, tunables, memory, stage)
+    prompt = _build_prompt(report, tunables, memory, stage, code_summary)
     backend = _select_backend()
     if backend == "claude_cli":
         return _propose_via_claude_cli(prompt, tunables, stage, max_retries)
@@ -394,8 +447,14 @@ def _propose_via_claude_cli(
 # Internal helpers
 # ---------------------------------------------------------------------------
 
-def _build_prompt(report: dict, tunables: dict, memory: dict, stage: int) -> str:
-    """组装发给 LLM 的 prompt。"""
+def _build_prompt(report: dict, tunables: dict, memory: dict, stage: int,
+                  code_summary: str = "") -> str:
+    """组装发给 LLM 的 prompt。
+
+    code_summary（阶段2≥）：可 patch 的结构摘要（如 train_map.tscn 的 MidPlatform
+    anchor 多行块 + 改动指引），stage>=2 时拼入 prompt 引导 structural 提案；
+    默认空串 → 阶段1 prompt 零回归。
+    """
     # 阶段限制
     stage_constraint = {
         1: "【阶段限制】当前为阶段1：change_type 只能是 tunable_search（仅调数值参数），不得提 structural 或 logic 改动。",
@@ -423,6 +482,11 @@ def _build_prompt(report: dict, tunables: dict, memory: dict, stage: int) -> str
     issues_text = json.dumps(report.get("issues", []), ensure_ascii=False, indent=2)
     summary_text = json.dumps(report.get("summary", {}), ensure_ascii=False, indent=2)
 
+    # 阶段2≥：可 patch 的结构摘要（anchor + 改动指引），引导 structural 提案。
+    code_summary_block = ""
+    if stage >= 2 and code_summary:
+        code_summary_block = "\n【可 patch 的结构摘要（structural 改动只能动这些）】\n" + code_summary
+
     return f"""你是一个游戏平衡优化专家。请分析以下诊断报告，提出一个**可验证的改动假设**。
 
 【铁律】
@@ -444,6 +508,7 @@ def _build_prompt(report: dict, tunables: dict, memory: dict, stage: int) -> str
 {params_summary}
 
 {memory_summary}
+{code_summary_block}
 
 请提交一个改动计划(严格符合改动计划 JSON schema:target_issue/hypothesis/change_type/expected_effect 必填,tunable_search 时含 search_space)。
 """.strip()

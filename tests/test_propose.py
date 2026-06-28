@@ -399,6 +399,77 @@ class TestParsePlanStageConstraints:
             parse_plan(json.dumps(plan), TUNABLES)  # 不传 stage，默认 1
 
 
+class TestParsePlanStructuralValidation:
+    """stage=2 structural patches 校验(阶段2 第①层防御,critic C1/M4)。"""
+
+    def _structural(self, patches):
+        return json.dumps({
+            "target_issue": "death_hotspot",
+            "hypothesis": "踏脚石平台位置不佳",
+            "change_type": "structural",
+            "patches": patches,
+            "expected_effect": "death 减少",
+        })
+
+    def test_structural_accepted_at_stage2(self):
+        plan = self._structural([{
+            "file": "res://rl/train_map.tscn",
+            "anchor": '[node name="MidPlatform" type="StaticBody2D" parent="."]\n'
+                      "position = Vector2(600, 40)",
+            "new": '[node name="MidPlatform" type="StaticBody2D" parent="."]\n'
+                   "position = Vector2(700, 40)",
+        }])
+        result = parse_plan(plan, TUNABLES, stage=2)
+        assert result["change_type"] == "structural"
+
+    def test_structural_rejected_at_stage1(self):
+        plan = self._structural([{
+            "file": "res://rl/train_map.tscn", "anchor": "a", "new": "b"}])
+        with pytest.raises(ValueError, match="stage"):
+            parse_plan(plan, TUNABLES, stage=1)
+
+    def test_structural_missing_patches_rejected(self):
+        plan = json.dumps({
+            "target_issue": "death_hotspot", "hypothesis": "x",
+            "change_type": "structural", "expected_effect": "y",
+        })
+        with pytest.raises(ValueError, match="patches"):
+            parse_plan(plan, TUNABLES, stage=2)
+
+    def test_structural_empty_patches_rejected(self):
+        with pytest.raises(ValueError, match="patches"):
+            parse_plan(self._structural([]), TUNABLES, stage=2)
+
+    def test_structural_patch_missing_key_rejected(self):
+        # 缺 new 键
+        with pytest.raises(ValueError):
+            parse_plan(self._structural(
+                [{"file": "res://rl/train_map.tscn", "anchor": "a"}]),
+                TUNABLES, stage=2)
+
+    def test_structural_patch_touching_protected_glob_rejected(self):
+        with pytest.raises(ValueError):
+            parse_plan(self._structural(
+                [{"file": "res://../harness/optimize.py",
+                  "anchor": "a", "new": "b"}]), TUNABLES, stage=2)
+
+    def test_structural_patch_touching_game_agent_rejected(self):
+        with pytest.raises(ValueError):
+            parse_plan(self._structural(
+                [{"file": "res://rl/game_agent.gd",
+                  "anchor": "a", "new": "b"}]), TUNABLES, stage=2)
+
+    def test_logic_rejected_at_stage2(self):
+        plan = json.dumps({
+            "target_issue": "monotony", "hypothesis": "x",
+            "change_type": "logic",
+            "patches": [{"file": "res://enemy.gd", "anchor": "a", "new": "b"}],
+            "expected_effect": "y",
+        })
+        with pytest.raises(ValueError, match="stage"):
+            parse_plan(plan, TUNABLES, stage=2)
+
+
 class TestParsePlanDuplicateKey:
     """search_space 中同 key 出现两次 → ValueError。"""
 
