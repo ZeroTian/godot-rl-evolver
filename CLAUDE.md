@@ -42,8 +42,12 @@ PROJ=/mnt/e/code/你的游戏 SCENE=res://rl/train.tscn TIMESTEPS=60000 bash har
 PROJ=... SCENE=... MODEL=~/.local/share/godot-rl-venv/ppo_game.zip bash harness/run_infer.sh
 #   run_infer.sh 默认 DIAGNOSE=1:推理结束后自动对最新 telemetry 跑 diagnose.py
 
-# GDScript 语法校验(无 Python 测试覆盖,改 .gd 后这样验)
-( cd $PROJ && /mnt/d/Godot/Godot_console.exe --headless --path . --check-only res://rl/xxx.gd )
+# GDScript 校验(无 Python 测试覆盖,改 .gd 后这样验)
+# 项目级(推荐,会加载 autoload 编译全部脚本并退出;rc=0 且无 "SCRIPT ERROR" 即过):
+( cd $PROJ && /mnt/d/Godot/Godot_console.exe --headless --path . --import )
+# 单个「不引用 autoload」的脚本可用 --check-only,但必须配 --script,否则会被当主场景运行而卡死:
+( cd $PROJ && /mnt/d/Godot/Godot_console.exe --headless --path . --check-only --script res://rl/xxx.gd )
+#   ⚠️ 引用 Tunables 等 autoload 的脚本用 --check-only --script 会误报 "Identifier not found",改用上面的 --import
 ```
 
 Python 依赖装在仓库**外**的 venv(`~/.local/share/godot-rl-venv`,装 `godot-rl
