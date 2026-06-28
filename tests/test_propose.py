@@ -1,12 +1,16 @@
 """
 tests/test_propose.py — TDD for harness/llm_propose.py
 
-核心测试 parse_plan(text, tunables) 纯函数：
+核心测试 parse_plan(text, tunables, stage=1) 纯函数：
   - 合法 JSON → 返回改动计划 dict（schema spec §5.2）
   - 非法 JSON → ValueError
   - 缺 change_type → ValueError
   - search_space key 不在 tunables → ValueError
   - search_space range 越界（超出 tunables.range）→ ValueError
+  - stage=1 时 structural/logic → ValueError
+  - 重复 key（search_space 中同 key 出现两次）→ ValueError
+  - 反向 range（高 < 低）→ ValueError
+  - 禁用前缀 reward_*/goal_*/fall_*/telemetry_*/diagnose_* → ValueError
 
 propose() 中的 LLM 调用用 unittest.mock patch，绝不真调 API。
 """
@@ -31,6 +35,18 @@ TUNABLES = {
                       "desc": "敌人血量"},
         "jump_force":{"value": 400, "range": [300, 600],"type": "float",
                       "desc": "跳跃力"},
+        "enemy_speed": {"value": 50.0, "range": [25.0, 100.0], "type": "float",
+                        "desc": "敌人移动速度"},
+    }
+}
+
+# tunables 中包含真实玩法三参数（供 testbed 用例）
+TESTBED_TUNABLES = {
+    "version": 1,
+    "params": {
+        "enemy_hp":    {"value": 40,    "range": [20, 100],    "type": "int",   "desc": "火骑士生命值"},
+        "enemy_speed": {"value": 50.0,  "range": [25.0, 100.0],"type": "float", "desc": "火骑士巡逻速度"},
+        "jump_force":  {"value": 360.0, "range": [280.0, 440.0],"type": "float","desc": "玩家起跳速度"},
     }
 }
 
@@ -97,7 +113,7 @@ class TestParsePlanValid:
         assert "patches" not in result or result.get("patches") is None or True
 
     def test_plan_with_patches_structural(self):
-        """structural 类型可以有 patches，不需要 search_space。"""
+        """structural 类型可以有 patches，不需要 search_space；需要 stage>=2。"""
         plan = {
             "target_issue": "death_hotspot",
             "hypothesis": "关卡结构问题",
@@ -106,7 +122,7 @@ class TestParsePlanValid:
             "expected_effect": "death 减少",
             "confidence": 0.5,
         }
-        result = parse_plan(json.dumps(plan), TUNABLES)
+        result = parse_plan(json.dumps(plan), TUNABLES, stage=2)
         assert result["change_type"] == "structural"
 
     def test_range_exactly_at_boundary(self):
@@ -304,3 +320,231 @@ class TestProposeMocked:
 
         with pytest.raises(ValueError):
             propose(SAMPLE_REPORT, TUNABLES, SAMPLE_MEMORY, stage=1)
+
+
+# ---------------------------------------------------------------------------
+# Task 6: stage 限制、重复 key、反向 range、禁用前缀
+# ---------------------------------------------------------------------------
+
+class TestParsePlanStageConstraints:
+    """stage=1 只允许 tunable_search；structural/logic 被拒。"""
+
+    def test_stage1_rejects_structural(self):
+        plan = {
+            "target_issue": "death_hotspot",
+            "hypothesis": "关卡结构问题",
+            "change_type": "structural",
+            "patches": [{"file": "res://level.tscn", "anchor": "...", "new": "..."}],
+            "expected_effect": "death 减少",
+        }
+        with pytest.raises(ValueError, match="stage"):
+            parse_plan(json.dumps(plan), TUNABLES, stage=1)
+
+    def test_stage1_rejects_logic(self):
+        plan = {
+            "target_issue": "monotony",
+            "hypothesis": "逻辑问题",
+            "change_type": "logic",
+            "patches": [{"file": "res://enemy.gd", "anchor": "...", "new": "..."}],
+            "expected_effect": "动作多样性提升",
+        }
+        with pytest.raises(ValueError, match="stage"):
+            parse_plan(json.dumps(plan), TUNABLES, stage=1)
+
+    def test_stage1_allows_tunable_search(self):
+        """stage=1 时 tunable_search 应放行。"""
+        result = parse_plan(VALID_PLAN_TEXT, TUNABLES, stage=1)
+        assert result["change_type"] == "tunable_search"
+
+    def test_stage2_allows_structural(self):
+        """stage=2 时 structural 应放行。"""
+        plan = {
+            "target_issue": "death_hotspot",
+            "hypothesis": "关卡结构问题",
+            "change_type": "structural",
+            "patches": [{"file": "res://level.tscn", "anchor": "...", "new": "..."}],
+            "expected_effect": "death 减少",
+        }
+        result = parse_plan(json.dumps(plan), TUNABLES, stage=2)
+        assert result["change_type"] == "structural"
+
+    def test_stage3_allows_logic(self):
+        """stage=3 时 logic 应放行。"""
+        plan = {
+            "target_issue": "monotony",
+            "hypothesis": "逻辑问题",
+            "change_type": "logic",
+            "patches": [{"file": "res://enemy.gd", "anchor": "...", "new": "..."}],
+            "expected_effect": "动作多样性提升",
+        }
+        result = parse_plan(json.dumps(plan), TUNABLES, stage=3)
+        assert result["change_type"] == "logic"
+
+    def test_default_stage_is_1(self):
+        """parse_plan 默认 stage=1，structural 应被拒。"""
+        plan = {
+            "target_issue": "death_hotspot",
+            "hypothesis": "关卡结构问题",
+            "change_type": "structural",
+            "patches": [{"file": "res://level.tscn", "anchor": "...", "new": "..."}],
+            "expected_effect": "death 减少",
+        }
+        with pytest.raises(ValueError, match="stage"):
+            parse_plan(json.dumps(plan), TUNABLES)  # 不传 stage，默认 1
+
+
+class TestParsePlanDuplicateKey:
+    """search_space 中同 key 出现两次 → ValueError。"""
+
+    def test_duplicate_key_in_search_space_raises(self):
+        plan = {
+            "target_issue": "difficulty_too_hard",
+            "hypothesis": "重复 key 测试",
+            "change_type": "tunable_search",
+            "search_space": [
+                {"key": "gap_width", "range": [80, 160]},
+                {"key": "gap_width", "range": [90, 150]},  # 同 key 重复
+            ],
+            "expected_effect": "completion_rate 提升",
+        }
+        with pytest.raises(ValueError, match="重复"):
+            parse_plan(json.dumps(plan), TUNABLES, stage=1)
+
+    def test_different_keys_not_duplicate(self):
+        """不同 key 不构成重复，应放行。"""
+        plan = {
+            "target_issue": "difficulty_too_hard",
+            "hypothesis": "多参数搜索",
+            "change_type": "tunable_search",
+            "search_space": [
+                {"key": "gap_width", "range": [80, 160]},
+                {"key": "jump_force", "range": [320, 550]},
+            ],
+            "expected_effect": "completion_rate 提升",
+        }
+        result = parse_plan(json.dumps(plan), TUNABLES, stage=1)
+        assert len(result["search_space"]) == 2
+
+
+class TestParsePlanReversedRange:
+    """反向范围（range[0] > range[1]）→ ValueError。"""
+
+    def test_reversed_range_raises(self):
+        plan = {
+            "target_issue": "difficulty_too_hard",
+            "hypothesis": "反向 range 测试",
+            "change_type": "tunable_search",
+            "search_space": [{"key": "gap_width", "range": [160, 80]}],  # 高 < 低
+            "expected_effect": "completion_rate 提升",
+        }
+        with pytest.raises(ValueError, match="range"):
+            parse_plan(json.dumps(plan), TUNABLES, stage=1)
+
+    def test_equal_range_values_raises(self):
+        """range[0] == range[1] 同样是退化范围，应拒绝。"""
+        plan = {
+            "target_issue": "difficulty_too_hard",
+            "hypothesis": "相等 range 测试",
+            "change_type": "tunable_search",
+            "search_space": [{"key": "gap_width", "range": [120, 120]}],
+            "expected_effect": "completion_rate 提升",
+        }
+        with pytest.raises(ValueError, match="range"):
+            parse_plan(json.dumps(plan), TUNABLES, stage=1)
+
+
+class TestParsePlanBannedPrefixes:
+    """禁用前缀 reward_*/goal_*/fall_*/telemetry_*/diagnose_* → ValueError。"""
+
+    def _reward_plan(self, key: str) -> str:
+        """构造 search_space 包含禁用前缀 key 的计划文本。"""
+        plan = {
+            "target_issue": "difficulty_too_hard",
+            "hypothesis": f"禁用前缀 {key} 测试",
+            "change_type": "tunable_search",
+            "search_space": [{"key": key, "range": [1.0, 10.0]}],
+            "expected_effect": "测试",
+        }
+        return json.dumps(plan)
+
+    # 禁用前缀：reward_*
+    def test_reward_prefix_rejected(self):
+        with pytest.raises(ValueError):
+            parse_plan(self._reward_plan("reward_completion"), TUNABLES, stage=1)
+
+    def test_reward_death_prefix_rejected(self):
+        with pytest.raises(ValueError):
+            parse_plan(self._reward_plan("reward_death_penalty"), TUNABLES, stage=1)
+
+    # 禁用前缀：goal_*
+    def test_goal_prefix_rejected(self):
+        with pytest.raises(ValueError):
+            parse_plan(self._reward_plan("goal_x"), TUNABLES, stage=1)
+
+    # 禁用前缀：fall_*
+    def test_fall_prefix_rejected(self):
+        with pytest.raises(ValueError):
+            parse_plan(self._reward_plan("fall_y"), TUNABLES, stage=1)
+
+    # 禁用前缀：telemetry_*
+    def test_telemetry_prefix_rejected(self):
+        with pytest.raises(ValueError):
+            parse_plan(self._reward_plan("telemetry_interval"), TUNABLES, stage=1)
+
+    # 禁用前缀：diagnose_*
+    def test_diagnose_prefix_rejected(self):
+        with pytest.raises(ValueError):
+            parse_plan(self._reward_plan("diagnose_threshold"), TUNABLES, stage=1)
+
+
+class TestParsePlanTestbedParams:
+    """testbed 三参数（enemy_hp/enemy_speed/jump_force）应正常放行。"""
+
+    def test_enemy_hp_allowed(self):
+        plan = {
+            "target_issue": "difficulty_too_hard",
+            "hypothesis": "降低敌人血量",
+            "change_type": "tunable_search",
+            "search_space": [{"key": "enemy_hp", "range": [20, 80]}],
+            "expected_effect": "completion_rate 提升",
+        }
+        result = parse_plan(json.dumps(plan), TESTBED_TUNABLES, stage=1)
+        assert result["search_space"][0]["key"] == "enemy_hp"
+
+    def test_enemy_speed_allowed(self):
+        plan = {
+            "target_issue": "difficulty_too_hard",
+            "hypothesis": "降低敌人速度",
+            "change_type": "tunable_search",
+            "search_space": [{"key": "enemy_speed", "range": [25.0, 75.0]}],
+            "expected_effect": "completion_rate 提升",
+        }
+        result = parse_plan(json.dumps(plan), TESTBED_TUNABLES, stage=1)
+        assert result["search_space"][0]["key"] == "enemy_speed"
+
+    def test_jump_force_allowed(self):
+        plan = {
+            "target_issue": "progress_stall",
+            "hypothesis": "提升跳跃力",
+            "change_type": "tunable_search",
+            "search_space": [{"key": "jump_force", "range": [300.0, 420.0]}],
+            "expected_effect": "探索覆盖提升",
+        }
+        result = parse_plan(json.dumps(plan), TESTBED_TUNABLES, stage=1)
+        assert result["search_space"][0]["key"] == "jump_force"
+
+    def test_all_three_together_allowed(self):
+        """三参数组合搜索应全部放行。"""
+        plan = {
+            "target_issue": "difficulty_too_hard",
+            "hypothesis": "综合调整",
+            "change_type": "tunable_search",
+            "search_space": [
+                {"key": "enemy_hp",    "range": [20, 80]},
+                {"key": "enemy_speed", "range": [25.0, 75.0]},
+                {"key": "jump_force",  "range": [300.0, 420.0]},
+            ],
+            "expected_effect": "综合改善",
+        }
+        result = parse_plan(json.dumps(plan), TESTBED_TUNABLES, stage=1)
+        assert len(result["search_space"]) == 3

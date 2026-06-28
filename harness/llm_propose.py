@@ -2,9 +2,13 @@
 harness/llm_propose.py — LLM 提案解析与生成
 
 两个公开接口：
-  parse_plan(text, tunables) -> dict
+  parse_plan(text, tunables, stage=1) -> dict
       纯函数：把 LLM 返回的 JSON 文本解析并校验为改动计划（spec §5.2）。
       校验失败抛 ValueError（含原因）。
+      stage 参数控制允许的 change_type：
+        stage=1：只允许 tunable_search
+        stage=2：允许 tunable_search、structural
+        stage=3：允许 tunable_search、structural、logic
 
   propose(report, tunables, memory, stage) -> dict
       组 prompt → 调 anthropic SDK（structured output via tool use）→ parse_plan。
@@ -21,6 +25,13 @@ harness/llm_propose.py — LLM 提案解析与生成
   "expected_effect": str,
   "confidence": float,
 }
+
+安全边界（防自欺硬边界，spec §4.1/§5.1）：
+  - search_space.key 必须在 tunables.params 白名单中（主要边界）
+  - search_space.key 禁止使用 reward_*/goal_*/fall_*/telemetry_*/diagnose_* 前缀（第二道保险）
+  - search_space.range 必须是子集（⊆ 作者 range），且 min < max（不允许反向/退化范围）
+  - search_space 中同一 key 不得重复出现
+  - 阶段 1 只允许 change_type=="tunable_search"
 """
 from __future__ import annotations
 
@@ -36,11 +47,21 @@ except ImportError:  # 允许在没装 SDK 的环境里 import（测试 mock 时
 # 允许的 change_type 值
 VALID_CHANGE_TYPES = {"tunable_search", "structural", "logic"}
 
+# 各阶段允许的 change_type（stage → 允许集合）
+_STAGE_ALLOWED_TYPES: dict[int, set[str]] = {
+    1: {"tunable_search"},
+    2: {"tunable_search", "structural"},
+    3: {"tunable_search", "structural", "logic"},
+}
+
 # 必填字段（所有 change_type 共用）
 REQUIRED_FIELDS = {"target_issue", "hypothesis", "change_type", "expected_effect"}
 
 # 重试上限
 MAX_RETRIES = 3
+
+# 禁用前缀：这些前缀的参数禁止进入 tunables（防误配置第二道保险）
+_BANNED_PREFIXES = ("reward_", "goal_", "fall_", "telemetry_", "diagnose_")
 
 # 改动计划的 tool schema（用于 anthropic structured output）
 _PLAN_TOOL = {
@@ -110,20 +131,24 @@ _PLAN_TOOL = {
 # parse_plan — 纯函数，校验 LLM 输出
 # ---------------------------------------------------------------------------
 
-def parse_plan(text: str, tunables: dict) -> dict:
+def parse_plan(text: str, tunables: dict, stage: int = 1) -> dict:
     """
     把 LLM 返回的 JSON 文本解析并校验为改动计划 dict。
 
     Args:
         text:     LLM 返回的 JSON 字符串（可能是整个响应体，也可能是 tool input 的 JSON）。
         tunables: tunables.json 全量（spec §5.1），用于校验 search_space。
+        stage:    优化阶段（默认 1）。
+                  stage=1 只允许 tunable_search；
+                  stage=2 增加 structural；stage=3 增加 logic。
 
     Returns:
         校验通过的改动计划 dict。
 
     Raises:
         ValueError: JSON 解析失败、必填字段缺失、change_type 非法、
-                    search_space 的 key/range 不合法。
+                    stage 不允许该 change_type、search_space 的 key/range 不合法、
+                    search_space 中 key 重复、range 反向/退化、key 含禁用前缀。
     """
     # 1. JSON 解析
     if not text or not text.strip():
@@ -148,18 +173,47 @@ def parse_plan(text: str, tunables: dict) -> dict:
             f"change_type 非法：{change_type!r}，合法值：{sorted(VALID_CHANGE_TYPES)}"
         )
 
-    # 4. tunable_search：校验 search_space
+    # 4. 阶段限制：stage 1 只允许 tunable_search
+    allowed_types = _STAGE_ALLOWED_TYPES.get(stage, VALID_CHANGE_TYPES)
+    if change_type not in allowed_types:
+        raise ValueError(
+            f"stage {stage} 不允许 change_type={change_type!r}，"
+            f"当前阶段只允许：{sorted(allowed_types)}"
+        )
+
+    # 5. tunable_search：校验 search_space
     if change_type == "tunable_search":
         search_space = plan.get("search_space")
         if not search_space:
             raise ValueError("change_type==tunable_search 时 search_space 不能为空")
         params = tunables.get("params", {})
+
+        # 5a. 重复 key 检测
+        seen_keys: set[str] = set()
         for entry in search_space:
             key = entry.get("key")
+            if key in seen_keys:
+                raise ValueError(
+                    f"search_space 中 key {key!r} 重复出现，每个参数只能出现一次"
+                )
+            seen_keys.add(key)
+
+        for entry in search_space:
+            key = entry.get("key")
+
+            # 5b. 禁用前缀检测（第二道保险，防止 reward/goal/fall/telemetry/diagnose 误入）
+            if any(key.startswith(prefix) for prefix in _BANNED_PREFIXES):
+                raise ValueError(
+                    f"search_space 中的 key {key!r} 含禁用前缀（"
+                    f"{', '.join(_BANNED_PREFIXES)}），这类参数禁止进入 tunables"
+                )
+
+            # 5c. 白名单检测：key 必须在 tunables.params 中
             if key not in params:
                 raise ValueError(
                     f"search_space 中的 key {key!r} 不在 tunables.params 里"
                 )
+
             proposed_range = entry.get("range", [])
             tunable_range = params[key].get("range", [])
             if len(proposed_range) != 2 or len(tunable_range) != 2:
@@ -167,8 +221,18 @@ def parse_plan(text: str, tunables: dict) -> dict:
                     f"search_space[{key!r}].range 格式错误：期望 [min, max]，"
                     f"实际得到 {proposed_range!r}，tunables.range={tunable_range!r}"
                 )
+
             p_min, p_max = proposed_range
             t_min, t_max = tunable_range
+
+            # 5d. 反向/退化范围检测（min 必须严格小于 max）
+            if p_min >= p_max:
+                raise ValueError(
+                    f"search_space[{key!r}].range [{p_min}, {p_max}] 是反向或退化范围"
+                    f"（要求 min < max）"
+                )
+
+            # 5e. 子范围检测（提议 range 必须 ⊆ 作者 range）
             if p_min < t_min or p_max > t_max:
                 raise ValueError(
                     f"search_space[{key!r}].range [{p_min}, {p_max}] "
