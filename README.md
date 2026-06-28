@@ -28,7 +28,11 @@ Python(SB3 PPO, server, :11008) ←TCP→ Godot(Sync 节点 + AIController, clie
 | `harness/recorder.gd` | 推理时截图(可按帧/按 episode 录) |
 | `harness/telemetry.gd` | **通用**度量采集 helper(RefCounted),按 episode 落盘 JSONL |
 | `harness/diagnose.py` | **通用**离线诊断器:读 JSONL → 规则引擎 → `report.json` + 摘要 |
-| `tests/test_diagnose.py` | 诊断器单测(24 例,纯标准库 + pytest) |
+| `harness/optimize.py` | **通用**优化闭环编排器:report → LLM 提案 → 贝叶斯搜数值 → 验证 → 接受/回滚 |
+| `harness/{llm_propose,search,objective,mutate,memory}.py` | 优化环子模块:LLM 提案/贝叶斯/客观分数/改动应用+git/记忆 |
+| `harness/run_optimize.sh` | 优化闭环入口(优化分支隔离,主分支不污染) |
+| `template/tunables.{json,gd}` | 游戏侧参数化:可调项清单 + `Tunables` autoload |
+| `tests/` | 诊断器 + 优化环单测(106 例,pytest) |
 | `template/agent_template.gd` | RL 控制器骨架,标注 **★ FILL ★** 的 4 个钩子 |
 | `template/env_template.gd` | env 根骨架(episode 复位 / 敌人重生 / 查询) |
 | `example_platformer/` | platformer 真实跑通的完整实现(参考样例) |
@@ -108,6 +112,33 @@ python harness/diagnose.py 路径/run_*.jsonl [--out report.json] [--thresholds 
 [LOW]  unstable_difficulty — 回报 CV=1.62,通关稳定性差
 ```
 
+## 优化闭环(自进化的「优化」环)
+
+度量环产出 `report.json` 后,优化环让 LLM **提改动假设**、贝叶斯优化**搜数值**、改完**再试玩验证**,
+客观分数真变好才接受(否则 git 回滚),全程记忆失败教训——闭合「试玩 → 度量 → 优化 → 再试玩」。
+
+**四条铁律**(调研 RuleSmith/Nova/TITAN 一致):① 解耦(LLM 只提案,不负责玩,玩交给 RL agent)
+② 不盲信 LLM 数值(改完必验,只有客观分数真变好才接受)③ 记忆失败教训喂回下一轮 ④ 用 `report` 派生的客观分数做锚,防 LLM 自欺。
+
+**安全脊梁**(全自动改动的命门):三道 gate(① 语法 `--check-only` ② smoke 试玩跑通 ③ 指标回归)
++ 全程 git 优化分支可回滚 + `PROTECTED_PATHS` 禁改路径入口 + 预算上限(轮数/搜索次数/早停)。
+
+**参数化接入**(在度量接入基础上加):把 `template/tunables.json` + `template/tunables.gd` 拷到
+`res://rl/`,在 `project.godot` 注册 `Tunables` autoload,游戏脚本用 `Tunables.get("gap_width", 120)`
+取代硬编码——数值改动改 JSON 即生效,无需碰代码(这是「解耦/可回滚」的载体)。
+
+**跑**:
+```bash
+PROJ=... SCENE=... MODEL=~/.local/share/godot-rl-venv/ppo_game.zip ANTHROPIC_API_KEY=sk-... \
+  bash harness/run_optimize.sh
+# → 在 PROJ 的 git 优化分支上跑闭环:LLM 圈参数 → 贝叶斯搜数值 → 验证 → 接受/回滚 → 记 memory
+#   结束打印总结(接受的改动 / score 前后 / 剩余 issue);cd $PROJ && git log 看可追溯的改动历史
+```
+
+> ⚠️ **分阶段**:**阶段1(当前)= 数值闭环**(只改 `tunables.json`,最安全,已建);阶段2 结构
+> (`.tscn`)、阶段3 逻辑(`.gd`)改动的架构已预留接口,由 `STAGE` 控制,后续交付。
+> API key 走环境变量 `ANTHROPIC_API_KEY`,**绝不入库**。
+
 ## 环境变量速查
 
 | 变量 | 默认 | 说明 |
@@ -125,3 +156,10 @@ python harness/diagnose.py 路径/run_*.jsonl [--out report.json] [--thresholds 
 | `DIAGNOSE` | 1 | 推理结束后是否自动跑 `diagnose.py`(0=关) |
 | `TELEMETRY_DIR` | `$PROJ/rl/telemetry` | telemetry JSONL 落盘目录 |
 | `GRID_CELL` | 64 | 探索覆盖/死亡热点的网格边长(像素) |
+| `STAGE` | 1 | 优化改动面:1=数值 / 2=+结构 / 3=+逻辑 |
+| `TARGET_COMPLETION` | 0.65 | 优化目标通关率(客观分数用) |
+| `MAX_ROUNDS` / `PATIENCE` | 8 / 3 | 闭环最大轮数 / 连续无改善早停轮数 |
+| `SEARCH_CALLS` | 12 | 贝叶斯每轮评估预算 |
+| `RETRAIN_EACH` | 0 | 评估是否每次热启动重训(0=纯推理省钱) |
+| `PROTECTED_PATHS` | `harness/**,.git/**,tests/**,docs/**` | 禁止 LLM 修改的路径 glob |
+| `ANTHROPIC_API_KEY` | (优化必填) | LLM key,环境变量,**绝不入库** |

@@ -8,7 +8,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 玩家自动试玩任意游戏 → 度量(死亡热点/通关率/动作分布/难度/体感)→ 自动发现难度/平衡/单调/
 体感等**非故障问题** → 喂给 LLM 闭环改关卡/数值。进化循环:**试玩 → 度量 → 优化 → 再试玩**。
 
-- **当前已建成**:试玩(RL 玩家)环 + 度量/诊断环。**未建**:LLM 优化环 + 循环编排。
+- **当前已建成**:试玩(RL 玩家)环 + 度量/诊断环 + LLM 优化闭环(阶段1 数值)。**未建**:优化环阶段2/3(结构 `.tscn`/逻辑 `.gd` 改动)+ 循环编排。
 - 这是**工具链/模板仓**,不是某个具体游戏。真实跑通的样例在 `example_platformer/`
   (从 `godot-study/platformer` 抽出)。
 - 设计文档在 `docs/specs/2026-06-28-telemetry-diagnosis-design.md`,实现计划在
@@ -21,7 +21,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 | Python harness | `harness/*.py` `harness/*.sh` | **通用、与游戏无关**,全靠环境变量配置,不写死 obs/动作 |
 | GDScript 模板 | `template/*.gd` `harness/*.gd` | 拷进**你的** Godot 项目的 `res://rl/`,填 ★FILL★ 钩子后使用 |
 | 样例 | `example_platformer/*.gd *.tscn` | 模板在真实游戏里填好的参考实现 |
-| 诊断器单测 | `tests/test_diagnose.py` | 纯标准库 + pytest,唯一的自动化测试 |
+| 自动化测试 | `tests/` | pytest,诊断器 + 优化环(106 例);GDScript 不在内 |
 
 `harness/*.gd`(`telemetry.gd` `recorder.gd`)是 GDScript,**不在 Python 测试范围内**,只能靠
 Godot `--check-only` 做语法校验。模板/样例的 `.gd` 同理。
