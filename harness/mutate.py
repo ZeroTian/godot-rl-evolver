@@ -4,10 +4,16 @@
   allowed(plan, protected_globs) -> bool
   apply_tunable(path, key, value)    写回 tunables.json 并 clamp 到 range
 
-git 辅助（不单测，函数齐全即可）:
-  snapshot() -> str           返回当前 HEAD 的 sha，用于回滚锚点
-  rollback(sha)               git reset --hard <sha>
-  commit(msg)                 git add -A && git commit -m <msg>
+git 辅助（集成测试覆盖）:
+  snapshot(paths, repo_root=".") -> dict[str, bytes | None]
+      只读取白名单文件内容；文件不存在时记录 None。
+  rollback(snapshot_data, repo_root=".")
+      原子写恢复白名单文件；若快照为 None 则删除该文件。
+  commit(msg, paths, repo_root=".")
+      逐路径 git add -- <path>，再提交；只暂存白名单，不暂存其他文件。
+
+所有路径均先解析为 repo-relative，realpath 必须位于 repo_root 内，
+否则抛 ValueError。
 
 protected 默认:
   harness/**  .git/**  tests/**  docs/**
@@ -20,6 +26,7 @@ import fnmatch
 import json
 import os
 import subprocess
+import tempfile
 from typing import Any
 
 # --------------------------------------------------------------------------- #
@@ -120,17 +127,112 @@ def _run_git(*args: str, cwd: str | None = None) -> str:
     return result.stdout.strip()
 
 
-def snapshot(repo_root: str = ".") -> str:
-    """返回当前 HEAD commit sha，作为 rollback 锚点。"""
-    return _run_git("rev-parse", "HEAD", cwd=repo_root)
+def _resolve_repo_root(repo_root: str) -> str:
+    """解析并返回仓根的规范绝对路径。"""
+    return os.path.realpath(os.path.abspath(repo_root))
 
 
-def rollback(sha: str, repo_root: str = ".") -> None:
-    """回滚到指定 sha（git reset --hard）。"""
-    _run_git("reset", "--hard", sha, cwd=repo_root)
+def _check_path_in_repo(path: str, repo_root_real: str) -> str:
+    """验证 path 在仓根内，返回规范绝对路径。仓外则抛 ValueError。
+
+    path 可以是 repo-relative 或绝对路径。
+    对 symlink 使用 realpath，防止链接跳出仓库。
+    """
+    if os.path.isabs(path):
+        abs_path = path
+    else:
+        abs_path = os.path.join(repo_root_real, path)
+
+    # 先用 abspath 规范化（处理 ../），再用 realpath 解析 symlink
+    real_path = os.path.realpath(os.path.abspath(abs_path))
+
+    if not real_path.startswith(repo_root_real + os.sep) and real_path != repo_root_real:
+        raise ValueError(
+            f"路径 {path!r} 解析后位于仓库根目录之外: {real_path!r} 不在 {repo_root_real!r} 内"
+        )
+    return real_path
 
 
-def commit(msg: str, repo_root: str = ".") -> None:
-    """暂存所有改动并提交。"""
-    _run_git("add", "-A", cwd=repo_root)
+def snapshot(paths: list[str], repo_root: str = ".") -> dict[str, bytes | None]:
+    """读取白名单文件内容，返回快照字典。
+
+    Args:
+        paths:     repo-relative 或绝对路径列表（白名单）。
+        repo_root: git 仓根路径，默认当前目录。
+
+    Returns:
+        dict，key 为传入的路径字符串，value 为文件 bytes；
+        文件不存在时 value 为 None。
+
+    Raises:
+        ValueError: 路径解析后位于 repo_root 之外。
+    """
+    repo_root_real = _resolve_repo_root(repo_root)
+    result: dict[str, bytes | None] = {}
+    for p in paths:
+        real = _check_path_in_repo(p, repo_root_real)
+        if os.path.exists(real):
+            with open(real, "rb") as f:
+                result[p] = f.read()
+        else:
+            result[p] = None
+    return result
+
+
+def rollback(snapshot_data: dict[str, bytes | None], repo_root: str = ".") -> None:
+    """将白名单文件原子写回快照内容。
+
+    Args:
+        snapshot_data: snapshot() 返回的字典。
+        repo_root:     git 仓根路径。
+
+    行为:
+        - value 为 bytes：将内容写回文件（原子写，先写临时文件再 rename）。
+        - value 为 None：删除该文件（如果存在）。
+
+    Raises:
+        ValueError: 路径解析后位于 repo_root 之外。
+    """
+    repo_root_real = _resolve_repo_root(repo_root)
+    for p, content in snapshot_data.items():
+        real = _check_path_in_repo(p, repo_root_real)
+        if content is None:
+            # 快照时不存在 → 删除
+            if os.path.exists(real):
+                os.remove(real)
+        else:
+            # 原子写：先写同目录临时文件，再 rename
+            dir_ = os.path.dirname(real)
+            os.makedirs(dir_, exist_ok=True)
+            fd, tmp = tempfile.mkstemp(dir=dir_)
+            try:
+                with os.fdopen(fd, "wb") as f:
+                    f.write(content)
+                os.replace(tmp, real)
+            except Exception:
+                if os.path.exists(tmp):
+                    os.remove(tmp)
+                raise
+
+
+def commit(msg: str, paths: list[str], repo_root: str = ".") -> None:
+    """只暂存白名单路径并提交。
+
+    Args:
+        msg:       commit 消息。
+        paths:     repo-relative 或绝对路径列表（白名单）。
+        repo_root: git 仓根路径。
+
+    Raises:
+        ValueError: 路径解析后位于 repo_root 之外。
+    """
+    repo_root_real = _resolve_repo_root(repo_root)
+    for p in paths:
+        _check_path_in_repo(p, repo_root_real)
+        # 转为 repo-relative 路径传给 git，确保 git 能定位
+        if os.path.isabs(p):
+            rel = os.path.relpath(p, repo_root_real)
+        else:
+            rel = p
+        _run_git("add", "--", rel, cwd=repo_root)
     _run_git("commit", "-m", msg, cwd=repo_root)
