@@ -11,20 +11,24 @@ set -u
 : "${VENV:=$HOME/.local/share/godot-rl-venv}"
 : "${PORT:=11008}"
 : "${SPEEDUP:=8}"          # 必须与训练一致!
-: "${INFER_STEPS:=600}"
+: "${EVAL_SEED:=3}"        # 同一 seed 同时喂 Python(RNG/env/model)与 Godot(--env_seed)
+: "${EVAL_EPISODES:=5}"    # 按 episode 停止:达到此局数才结束
+: "${MAX_EVAL_STEPS:=40000}"  # 步数上限:先到则推理非 0 退出(评估失败)
 HARNESS="$(cd "$(dirname "$0")" && pwd)"
 
 source "$VENV/bin/activate"
 
-echo "=== 启动 Python 策略回放 server(:$PORT) ==="
-INFER_STEPS=$INFER_STEPS PORT=$PORT SPEEDUP=$SPEEDUP \
+echo "=== 启动 Python 策略回放 server(:$PORT, seed=$EVAL_SEED) ==="
+PORT=$PORT SPEEDUP=$SPEEDUP \
+  EVAL_SEED=$EVAL_SEED EVAL_EPISODES=$EVAL_EPISODES MAX_EVAL_STEPS=$MAX_EVAL_STEPS \
   python "$HARNESS/infer_rl.py" > /tmp/rl_infer.log 2>&1 &
 PYPID=$!
 
 sleep 6
 
 echo "=== 启动 Godot(非 headless,开窗口渲染 + Recorder 截图) ==="
-( cd "$PROJ" && "$GODOT" --path . "$SCENE" --port=$PORT --speedup=$SPEEDUP ) \
+( cd "$PROJ" && "$GODOT" --path . "$SCENE" --port=$PORT \
+    --speedup=$SPEEDUP --env_seed=$EVAL_SEED ) \
   > /tmp/infer_godot.log 2>&1 &
 GPID=$!
 
