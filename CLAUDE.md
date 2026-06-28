@@ -8,7 +8,9 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 玩家自动试玩任意游戏 → 度量(死亡热点/通关率/动作分布/难度/体感)→ 自动发现难度/平衡/单调/
 体感等**非故障问题** → 喂给 LLM 闭环改关卡/数值。进化循环:**试玩 → 度量 → 优化 → 再试玩**。
 
-- **当前已建成**:试玩(RL 玩家)环 + 度量/诊断环 + LLM 优化闭环(阶段1 数值)。**未建**:优化环阶段2/3(结构 `.tscn`/逻辑 `.gd` 改动)+ 循环编排。
+- **当前已建成**:试玩(RL 玩家)环 + 度量/诊断环 + LLM 优化闭环(阶段1 数值 + 阶段2 结构 `.tscn`)。**未建**:优化环阶段3(逻辑 `.gd` 改动)+ 循环编排。
+  - 阶段2 结构闭环:LLM 对 `.tscn` 提 anchor patch → 四步 gate(`tscn_sanity` 健全性 → Godot `--import` → smoke 试玩 → 指标回归)→ 接受/定向回滚。无贝叶斯(一次提案=一个候选)。测量边界**三层防御**(`parse_plan` / `mutate.allowed` 看 patches / `apply_patch` 带 `protected_globs`),默认 `PROTECTED_PATHS` 点名 `game_agent.gd` 等测量装置。结构旋钮=测试床灰盒平台 `MidPlatform`,**绝不**碰与 `GOAL_X` 耦合的 `GoalFlag`/reward/终止几何。
+  - ⚠️ **`--import` 对 `.tscn` 不可靠**(实测缺括号/悬空 SubResource/错误 node type 一律 rc=0 静默放过,甚至吞成默认值)→ 故 `harness/gates.py` 加纯 Python `tscn_sanity`(资源引用完整性+括号平衡)前置;smoke gate 是运行期最后兜底。
 - 这是**工具链/模板仓**,不是某个具体游戏。仓内测试床 `testbed_platformer/`(2D 平台跳跃,
   来源 `godot-study/platformer`)是可直接运行的 Godot 项目,已入仓;参考样例在 `example_platformer/`。
   测试床所用**模型不入仓**,须由 `MODEL` 环境变量显式指定外部路径,模型 SHA-256 进入运行 provenance。

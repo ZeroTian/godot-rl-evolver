@@ -123,8 +123,12 @@ python harness/diagnose.py 路径/run_*.jsonl [--out report.json] [--thresholds 
 **四条铁律**(调研 RuleSmith/Nova/TITAN 一致):① 解耦(LLM 只提案,不负责玩,玩交给 RL agent)
 ② 不盲信 LLM 数值(改完必验,只有客观分数真变好才接受)③ 记忆失败教训喂回下一轮 ④ 用 `report` 派生的客观分数做锚,防 LLM 自欺。
 
-**安全脊梁**(全自动改动的命门):三道 gate(① 语法 `--check-only` ② smoke 试玩跑通 ③ 指标回归)
-+ 全程 git 优化分支可回滚 + `PROTECTED_PATHS` 禁改路径入口 + 预算上限(轮数/搜索次数/早停)。
+**安全脊梁**(全自动改动的命门):三道 gate(① 语法 = `.tscn` 健全性检查 + Godot `--import` ②
+smoke 试玩跑通 ③ 指标回归)+ 全程 git 优化分支可回滚 + `PROTECTED_PATHS` 禁改路径入口 +
+预算上限(轮数/搜索次数/早停)。
+> ⚠️ **`--import` 对 `.tscn` 不可靠**:实测它对缺括号 `Vector2`、悬空 `SubResource` 引用、错误 node
+> type 一律 rc=0 静默放过(甚至把坏值吞成默认值=看似过 gate 实则没改游戏)。故阶段2 在 `--import`
+> 前加了一道纯 Python `tscn_sanity`(资源引用完整性 + 构造器括号平衡),smoke gate 是运行期兜底。
 
 **参数化接入**(在度量接入基础上加):把 `template/tunables.json` + `template/tunables.gd` 拷到
 `res://rl/`,在 `project.godot` 注册 `Tunables` autoload,游戏脚本用 `Tunables.get_param("gap_width", 120)`
@@ -142,8 +146,11 @@ PROJ=... SCENE=... MODEL=... ANTHROPIC_API_KEY=sk-... bash harness/run_optimize.
 #   配对验证 → 接受/回滚 → 记 memory;结束打印总结(接受的改动 / score 前后 / 剩余 issue)
 ```
 
-> ⚠️ **分阶段**:**阶段1(当前)= 数值闭环**(只改 `tunables.json`,最安全,已建);阶段2 结构
-> (`.tscn`)、阶段3 逻辑(`.gd`)改动的架构已预留接口,由 `STAGE` 控制,后续交付。
+> ⚠️ **分阶段**:**阶段1 = 数值闭环**(`STAGE=1`,只改 `tunables.json`,已建);**阶段2 = 结构闭环**
+> (`STAGE=2`,LLM 对 `.tscn` 提 anchor patch,四步 gate 后接受/回滚,已建);阶段3 逻辑(`.gd`)后续交付。
+> 阶段2 结构改动**无贝叶斯**(patch 是离散文本操作,一次提案=一个候选,直接四步 gate);测试床的
+> 结构旋钮是灰盒踏脚石平台 `MidPlatform`(挪它改难度,**绝不**碰与 `GOAL_X` 耦合的 `GoalFlag`/reward/终止几何)。
+> 跑结构闭环:`STAGE=2 MODEL=... SCENE=res://rl/train_map.tscn bash harness/run_optimize.sh`。
 > **LLM 后端**:`LLM_BACKEND=auto`(默认)有 `ANTHROPIC_API_KEY` 走 anthropic SDK,否则用本机
 > `claude` CLI(免 key);可显式设 `claude_cli`/`anthropic`。key 走环境变量,**绝不入库**。
 
@@ -173,9 +180,11 @@ PROJ=... SCENE=... MODEL=... ANTHROPIC_API_KEY=sk-... bash harness/run_optimize.
 | `STAGE` | 1 | 优化改动面：1=数值 / 2=+结构 / 3=+逻辑 |
 | `TARGET_COMPLETION` | 0.65 | 优化目标通关率（客观分数用） |
 | `MAX_ROUNDS` / `PATIENCE` | 8 / 3 | 闭环最大轮数 / 连续无改善早停轮数 |
-| `SEARCH_CALLS` | 12 | 贝叶斯每轮评估预算 |
+| `SEARCH_CALLS` | 12 | 贝叶斯每轮评估预算（仅数值搜索；结构改动无贝叶斯） |
 | `RETRAIN_EACH` | 0 | 评估是否每次热启动重训（0=纯推理省钱） |
-| `PROTECTED_PATHS` | `harness/**,.git/**,tests/**,docs/**` | 禁止 LLM 修改的路径 glob |
+| `SMOKE_MAX_STEPS` | 2000 | 阶段2 smoke gate 的步数预算（结构改动后跑 ≥1 局确认场景可起） |
+| `SMOKE_TIMEOUT_SECONDS` | 120 | 阶段2 smoke / 语法 gate 单次墙钟超时（秒） |
+| `PROTECTED_PATHS` | `harness/**,.git/**,tests/**,docs/**,*/rl/game_agent.gd,*/rl/telemetry.gd,*/rl/recorder.gd` | 禁止 LLM 修改的路径 glob（默认点名测量装置文件：`game_agent.gd` 含 `GOAL_X`/`FALL_Y`/reward，telemetry/recorder 是落盘装置） |
 | `THRESHOLDS` | — | 覆盖 diagnose 默认阈值的 JSON（如 `{"hard_completion":0.5}`），调诊断灵敏度 |
 | `LLM_BACKEND` | `auto` | `auto`/`anthropic`/`claude_cli`；auto 有 key 用 SDK,否则用本机 claude CLI（免 key） |
 | `ANTHROPIC_API_KEY` | （与 claude CLI 二选一） | anthropic SDK 的 key，环境变量，**绝不入库**；变量名本身可出现在文档/脚本/测试中，值不可入库 |

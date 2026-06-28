@@ -216,7 +216,9 @@ paired_improvement(base, candidate) = mean(
 
 | Gate | 检查 | 工具 | 失败含义 |
 |---|---|---|---|
-| ① 语法 | 改过的 `.gd`/`.tscn` 能编译 | Godot `--headless --path . --import`(加载 autoload 编译全部脚本并退出,rc=0 且无 `SCRIPT ERROR`) | LLM 产了非法代码 |
+| ① 语法 | 改过的 `.gd`/`.tscn` 能编译 | **先**纯 Python `tscn_sanity`(资源引用完整性+构造器括号平衡)**再** Godot `--headless --path . --import`(加载 autoload 编译全部脚本,rc=0 且无 `SCRIPT ERROR`/`Parse Error`/`Failed to load script`) | LLM 产了非法代码 |
+
+> ⚠️ **阶段2 实测**:`--import` 对 `.tscn` 不可靠——缺括号 `Vector2`、悬空 `SubResource` 引用、错误 node type 一律 rc=0 无标记静默放过(甚至把坏值吞成默认值=看似过 gate 实则没改游戏,是测量隐患)。故 Gate ① 前置纯 Python `tscn_sanity`(`harness/gates.py`)拦下这两类最常见的 patch 破坏;`.gd` 编译错与极端 `.tscn` 结构破坏仍靠 `--import` 捕获;smoke gate(Gate ②)是运行期最后兜底。
 | ② smoke | 在 `SMOKE_MAX_STEPS`/超时内产出 ≥1 真 episode | 复用支持 episode 目标的 `run_infer.sh` | 改动破坏了可运行性 |
 | ③ 指标回归 | 候选 `scorē`(配对重复均值)较 baseline 改善 **> `MIN_IMPROVEMENT`** | `objective.score` | 改动无效/有害/仅噪声 |
 
