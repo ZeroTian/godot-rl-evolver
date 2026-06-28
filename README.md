@@ -131,17 +131,21 @@ python harness/diagnose.py 路径/run_*.jsonl [--out report.json] [--thresholds 
 取代硬编码——数值改动改 JSON 即生效,无需碰代码(这是「解耦/可回滚」的载体)。
 > ⚠️ 使用 `Tunables.get_param()` 而非 `Tunables.get()`：后者与 Godot 内置 `Object.get()` 冲突。
 
-**跑**:
+**跑**(LLM 后端二选一):
 ```bash
-PROJ=... SCENE=... MODEL=~/.local/share/godot-rl-venv/ppo_game.zip ANTHROPIC_API_KEY=sk-... \
-  bash harness/run_optimize.sh
-# → 在 PROJ 的 git 优化分支上跑闭环:LLM 圈参数 → 贝叶斯搜数值 → 验证 → 接受/回滚 → 记 memory
-#   结束打印总结(接受的改动 / score 前后 / 剩余 issue);cd $PROJ && git log 看可追溯的改动历史
+# ① 免 key:用本机 Claude Code CLI(复用订阅认证,推荐)
+LLM_BACKEND=claude_cli MODEL=~/.local/share/godot-rl-venv/ppo_game.zip \
+  SCENE=res://rl/train_map.tscn bash harness/run_optimize.sh
+# ② 或用 anthropic API key
+PROJ=... SCENE=... MODEL=... ANTHROPIC_API_KEY=sk-... bash harness/run_optimize.sh
+# → 默认 PROJ=本仓 testbed_platformer;在 git 优化分支上跑闭环:LLM 圈参数 → 贝叶斯搜数值 →
+#   配对验证 → 接受/回滚 → 记 memory;结束打印总结(接受的改动 / score 前后 / 剩余 issue)
 ```
 
 > ⚠️ **分阶段**:**阶段1(当前)= 数值闭环**(只改 `tunables.json`,最安全,已建);阶段2 结构
 > (`.tscn`)、阶段3 逻辑(`.gd`)改动的架构已预留接口,由 `STAGE` 控制,后续交付。
-> API key 走环境变量 `ANTHROPIC_API_KEY`,**绝不入库**。
+> **LLM 后端**:`LLM_BACKEND=auto`(默认)有 `ANTHROPIC_API_KEY` 走 anthropic SDK,否则用本机
+> `claude` CLI(免 key);可显式设 `claude_cli`/`anthropic`。key 走环境变量,**绝不入库**。
 
 ## 环境变量速查
 
@@ -172,7 +176,9 @@ PROJ=... SCENE=... MODEL=~/.local/share/godot-rl-venv/ppo_game.zip ANTHROPIC_API
 | `SEARCH_CALLS` | 12 | 贝叶斯每轮评估预算 |
 | `RETRAIN_EACH` | 0 | 评估是否每次热启动重训（0=纯推理省钱） |
 | `PROTECTED_PATHS` | `harness/**,.git/**,tests/**,docs/**` | 禁止 LLM 修改的路径 glob |
-| `ANTHROPIC_API_KEY` | （优化必填） | LLM key，环境变量，**绝不入库**；变量名本身可出现在文档/脚本/测试中，值不可入库 |
+| `THRESHOLDS` | — | 覆盖 diagnose 默认阈值的 JSON（如 `{"hard_completion":0.5}`），调诊断灵敏度 |
+| `LLM_BACKEND` | `auto` | `auto`/`anthropic`/`claude_cli`；auto 有 key 用 SDK,否则用本机 claude CLI（免 key） |
+| `ANTHROPIC_API_KEY` | （与 claude CLI 二选一） | anthropic SDK 的 key，环境变量，**绝不入库**；变量名本身可出现在文档/脚本/测试中，值不可入库 |
 
 > **固定种子链**：`EVAL_SEED`（或 `EVAL_SEEDS` 中每个值）同时传给 Python `random.seed` /
 > `np.random.seed` / `torch.manual_seed` / `model.set_random_seed`，以及 Godot `--env_seed`，
