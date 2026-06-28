@@ -112,6 +112,10 @@ class Config:
         self.min_improvement = _env_float("MIN_IMPROVEMENT", 0.1)
         self.artifact_root = os.environ.get(
             "ARTIFACT_ROOT", os.path.join(".artifacts", "opt"))
+        # 本次 run 的唯一 id(run_optimize.sh 注入)。用于把每次 run 的 artifact 目录隔离到
+        # runs/<OPT_RUN_ID>/ 下(spec §4.2),否则二次运行会撞 run_one_seed 的「拒绝复用已存在
+        # 目录」(固定路径 .artifacts/opt/baseline/seed_1 跨 run 冲突)。
+        self.opt_run_id = os.environ.get("OPT_RUN_ID", "")
 
     def validate(self) -> None:
         """严格校验配对评估配置(spec §6/§7;非法即抛 ValueError)。
@@ -296,13 +300,13 @@ def evaluate_current(cfg: Config, *, point_id: str) -> evaluation.EvaluationResu
     """对 cfg.eval_seeds **按固定顺序**逐个 run_one_seed,返回 EvaluationResult。
 
     每个 (point, seed) 用启动前为空的独立 artifact 目录
-    `<artifact_root>/<point_id>/seed_<seed>/`,保证报告新鲜且互不污染。
-    seed 顺序对每个 point 完全一致(配对改善的前提)。
+    `<artifact_root>/runs/<OPT_RUN_ID>/<point_id>/seed_<seed>/`,保证报告新鲜、互不污染,
+    且**跨 run 不冲突**(每次 run 的 OPT_RUN_ID 唯一)。seed 顺序对每个 point 完全一致(配对改善前提)。
     """
     runs = []
     for seed in cfg.eval_seeds:
         artifact_dir = os.path.join(
-            cfg.artifact_root, point_id, "seed_%d" % seed)
+            cfg.artifact_root, "runs", cfg.opt_run_id, point_id, "seed_%d" % seed)
         runs.append(run_one_seed(cfg, seed=seed, artifact_dir=artifact_dir))
     return evaluation.EvaluationResult(tuple(runs))
 

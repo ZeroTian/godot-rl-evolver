@@ -609,6 +609,27 @@ def test_evaluate_current_returns_evaluation_result(tmp_path, monkeypatch):
     assert result.mean_score == pytest.approx(1.5)
 
 
+def test_evaluate_current_isolates_artifact_dir_by_run_id(tmp_path, monkeypatch):
+    """artifact_dir 必须含 OPT_RUN_ID,使不同 run 互不冲突。
+
+    回归:固定路径 .artifacts/opt/baseline/seed_1 二次运行撞 run_one_seed 的
+    FileExistsError(端到端实跑暴露)。
+    """
+    cfg = _eval_cfg(tmp_path, eval_seeds=(1,))
+    cfg.opt_run_id = "RUN_ABC"
+    captured = []
+
+    def _fake(c, *, seed, artifact_dir):
+        captured.append(artifact_dir)
+        return evaluation.RunResult(seed=seed, telemetry_path="x", run_id="r",
+                                    report={}, score=0.0, provenance={})
+
+    monkeypatch.setattr(optimize, "run_one_seed", _fake)
+    optimize.evaluate_current(cfg, point_id="baseline")
+    assert "RUN_ABC" in captured[0]
+    assert captured[0].endswith(os.path.join("RUN_ABC", "baseline", "seed_1"))
+
+
 def _variance(xs):
     m = sum(xs) / len(xs)
     return sum((x - m) ** 2 for x in xs) / len(xs)
