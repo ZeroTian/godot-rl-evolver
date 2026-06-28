@@ -2,7 +2,7 @@ extends RefCounted
 ## 通用 telemetry 采集 helper(虚拟手柄式 RL 试玩的"度量"环)。
 ## 累计通用指标(局长/回报/动作占比/动作熵/探索覆盖/终止位置),按 episode 落盘 JSONL。
 ## 落盘格式正是 harness/diagnose.py 消费的契约。详见
-## docs/superpowers/specs/2026-06-28-telemetry-diagnosis-design.md §4.1 / §5.1
+## docs/specs/2026-06-28-telemetry-diagnosis-design.md §4.1 / §5.1
 ##
 ## 用法(在 env / agent 里):
 ##   var tele = preload("res://rl/telemetry.gd").new()

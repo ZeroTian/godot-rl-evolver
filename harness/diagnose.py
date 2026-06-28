@@ -1,7 +1,7 @@
 """通用试玩诊断器:读 telemetry JSONL → 聚合 → 规则引擎 → report.json + 摘要。
 
 与具体游戏无关(纯标准库)。设计见
-docs/superpowers/specs/2026-06-28-telemetry-diagnosis-design.md。
+docs/specs/2026-06-28-telemetry-diagnosis-design.md。
 """
 import json
 import math

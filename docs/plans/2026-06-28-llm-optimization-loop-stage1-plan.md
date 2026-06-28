@@ -1,7 +1,7 @@
 # 实施计划 · LLM 优化闭环 阶段1(数值闭环 MVP)
 
 > 日期: 2026-06-28 ｜ 状态: **pending approval**(待用户批准执行)
-> 设计依据: `docs/superpowers/specs/2026-06-28-llm-optimization-loop-design.md`(spec 已通过 brainstorming + 用户复审)
+> 设计依据: `docs/specs/2026-06-28-llm-optimization-loop-design.md`(spec 已通过 brainstorming + 用户复审)
 > 范围: spec §8 表的**阶段1** —— 仅 `tunable_search`(数值)改动,跑通整个闭环骨架(提案/搜索/分数/三道 gate/记忆/git 回滚)。结构(.tscn)/逻辑(.gd)改动属阶段2/3,本计划不实现,但架构为其预留接口。
 
 ## 1. 需求摘要
@@ -19,7 +19,7 @@
 | 数值参数候选 | reward 系数(平衡)+ 关卡几何(难度) | `game_agent.gd:8-12,157,164,169,190,193,199` |
 | 评估策略 | 阶段1 默认**纯推理评估**(`RETRAIN_EACH=0`):改数值后用现有策略试玩,反映"会玩的玩家在新难度下的体验" | spec §4.4 |
 | LLM 模型 | 最新 Claude(`claude-opus-4-8` 或同代),`anthropic` SDK,key 走 `ANTHROPIC_API_KEY` 环境变量,绝不入库 | CLAUDE.md 隐私规则 |
-| 计划/spec 路径 | 入库交付物放 `docs/`(superpowers 已弃用,不再用该路径) | 用户指示 |
+| 计划/spec 路径 | 入库交付物放 `docs/specs/` + `docs/plans/` | 用户指示 |
 
 ## 3. 验收标准(可测)
 

@@ -4,7 +4,7 @@
 
 为 godot-rl-evolver 实现「试玩 → 度量 → 诊断」链路的第二环:Godot 侧通用 telemetry 采集 helper
 (落盘 JSONL)+ Python 侧离线诊断器(规则引擎 → `report.json`)。设计详见
-`docs/superpowers/specs/2026-06-28-telemetry-diagnosis-design.md`,本计划是其逐步实现。
+`docs/specs/2026-06-28-telemetry-diagnosis-design.md`,本计划是其逐步实现。
 
 实现顺序为 bottom-up:先纯 Python 诊断器(用合成 fixture 完全 TDD,不依赖 Godot)→ Godot 采集 helper
 → example_platformer 真实接入并端到端验证 → 模板示范 + shell 集成 + 文档。

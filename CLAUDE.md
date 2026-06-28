@@ -11,8 +11,8 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 - **当前已建成**:试玩(RL 玩家)环 + 度量/诊断环。**未建**:LLM 优化环 + 循环编排。
 - 这是**工具链/模板仓**,不是某个具体游戏。真实跑通的样例在 `example_platformer/`
   (从 `godot-study/platformer` 抽出)。
-- 设计文档在 `docs/superpowers/specs/2026-06-28-telemetry-diagnosis-design.md`,实现计划在
-  `docs/superpowers/plans/`。改度量/诊断相关代码前应先读 spec。
+- 设计文档在 `docs/specs/2026-06-28-telemetry-diagnosis-design.md`,实现计划在
+  `docs/plans/`。改度量/诊断相关代码前应先读 spec。
 
 ## 仓库的两套代码(关键心智模型)
 
