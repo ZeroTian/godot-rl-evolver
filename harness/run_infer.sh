@@ -32,3 +32,16 @@ wait $PYPID
 sleep 1
 kill $GPID 2>/dev/null
 echo "=== 回放结束 ==="
+
+# 推理结束后自动诊断(DIAGNOSE=1 默认开;游戏侧需已接入 telemetry.gd)
+if [ "${DIAGNOSE:-1}" = "1" ]; then
+  TELEMETRY_DIR="${TELEMETRY_DIR:-$PROJ/rl/telemetry}"
+  latest=$(ls -t "$TELEMETRY_DIR"/run_*.jsonl 2>/dev/null | head -1)
+  if [ -n "$latest" ]; then
+    echo "=== 诊断:$latest ==="
+    python "$HARNESS/diagnose.py" "$latest"
+  else
+    echo "=== 未找到 telemetry($TELEMETRY_DIR),跳过诊断 ==="
+    echo "    (确认 env/agent 已接入 telemetry.gd;见 README「度量 + 诊断」)"
+  fi
+fi

@@ -5,6 +5,7 @@ extends Node2D
 
 const FK := preload("res://scenes/enemies/fire_knight/fire_knight.tscn")
 const LR := preload("res://scenes/enemies/leaf_ranger/leaf_ranger.tscn")
+const Telemetry = preload("res://rl/telemetry.gd")
 
 const PLAYER_START := Vector2(80, -30)
 const FK_START := Vector2(780, -30)   # 缺口对岸实地中段:落地后有空间走过去正面打(不贴坑边,避免被打退摔进缺口)
@@ -14,9 +15,14 @@ const LR_START := Vector2(900, -30)
 @onready var ground: TileMapLayer = $Ground
 @onready var agent: AIController2D = $Agent
 
+var tele = null
+
 
 func _ready() -> void:
 	agent.bind(player, self)
+	tele = Telemetry.new()
+	tele.start_run({"scene": "res://rl/train_map.tscn", "model": OS.get_environment("MODEL"), "speedup": 8, "n_episodes": 0, "max_ep": 1500, "grid_cell": 64, "action_space": {"move": 3, "jump": 2, "attack": 2}})
+	agent.tele = tele
 	_reset_to_start()
 
 
@@ -94,3 +100,8 @@ func gap_ahead(player_pos: Vector2) -> float:
 	var ahead := player_pos + Vector2(28, 24)
 	var cell := ground.local_to_map(ground.to_local(ahead))
 	return 0.0 if ground.get_cell_source_id(cell) == -1 else 1.0
+
+
+func _exit_tree() -> void:
+	if tele:
+		tele.finish()

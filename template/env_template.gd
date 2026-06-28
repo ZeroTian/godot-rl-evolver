@@ -9,17 +9,38 @@ extends Node2D
 ##              ├─ (真地图/角色/敌人...)
 ##              └─ Agent(agent_template.gd 的子类)
 
+# ★ 度量:把 harness/telemetry.gd 拷到 res://rl/ 后预载
+const Telemetry = preload("res://rl/telemetry.gd")
+
 @onready var player: CharacterBody2D = $Player
 @onready var agent: AIController2D = $Agent
+
+var tele = null              # ★ 度量:采集 helper,_ready 创建并注入给 agent
 
 
 func _ready() -> void:
 	agent.bind(player, self)
+	# ★ 度量:开一次 run(落盘 res://rl/telemetry/run_<ts>.jsonl),并注入 agent
+	#   action_space 用于动作分布维度;max_ep 供诊断器判断「卡住/超时」
+	tele = Telemetry.new()
+	tele.start_run({
+		"scene": get_scene_file_path(),
+		"model": OS.get_environment("MODEL"),
+		"speedup": 8, "grid_cell": 64, "max_ep": 1500,
+		"action_space": {"move": 3, "jump": 2, "attack": 2},
+	})
+	agent.tele = tele
 	_reset_to_start()
 
 
 func reset_episode() -> void:
 	_reset_to_start()
+
+
+func _exit_tree() -> void:
+	# ★ 度量:推理/训练结束时 flush + 关闭 JSONL
+	if tele:
+		tele.finish()
 
 
 func _reset_to_start() -> void:

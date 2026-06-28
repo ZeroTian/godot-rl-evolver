@@ -1,10 +1,10 @@
 extends AIController2D
 ## ── RL 控制器骨架(虚拟手柄)──────────────────────────────────────────
 ## 复用点:用 Input.action_press/release 驱动「现成游戏」的 FSM,不改游戏脚本。
-## 接新游戏只需填 4 个钩子(下方 ★ FILL ★),其余(reset/done 握手、指标)通用。
+## 接新游戏只需填 4 个钩子(下方 ★ FILL ★),其余(reset/done 握手、指标、telemetry)通用。
 ##
-## 挂在被控角色下(或 env 根),由 env 根在 _ready 里 init(player) + 绑定 env。
-## 配套:同目录 env_template.gd(env 根) + 一个挂了 Sync 节点的训练场景。
+## 挂在被控角色下(或 env 根),由 env 根在 _ready 里 init(player) + 绑定 env + 注入 tele。
+## 配套:同目录 env_template.gd(env 根) + telemetry.gd(度量采集) + 一个挂了 Sync 节点的训练场景。
 
 const SPEED_REF := 300.0     # 观测归一化用的速度基准(按你的游戏调)
 const MAX_EP := 1500         # 每局最大物理帧(超时结束)
@@ -16,6 +16,12 @@ var _prev_attack := false
 # —— 通用指标(自动试玩用):攻击次数等,按需扩展 ——
 var _atk_presses := 0
 var dbg: FileAccess = null
+
+# —— ★ 度量(telemetry)——由 env 在 _ready 注入(agent.tele = tele);未注入时全部 no-op ——
+var tele = null
+var _last_term := "unknown"          # 本局终止原因(由 done 分支按真实条件设置)
+var _last_end_pos := Vector2.ZERO    # 本局终止位置(reset 前记录,死亡热点用)
+var _pending_record := false         # 仅真实终止才记录,过滤 godot_rl reset 产生的伪局
 
 
 func _ready() -> void:
@@ -76,6 +82,10 @@ func set_action(action) -> void:
 	elif not at: Input.action_release("attack")
 	_prev_attack = at
 
+	# ★ 度量:记录动作分布(各档使用率 + 动作序列熵 → 冗余/单调诊断)
+	if tele:
+		tele.record_action(action)
+
 
 func get_reward() -> float:
 	return reward            # reward 在 _physics_process 累计,sync 每步读后清零
@@ -90,6 +100,13 @@ func _physics_process(_delta: float) -> void:
 	# 复位握手:godot_rl 不会因 done 自动复位 → 终止时本类自己置了 needs_reset
 	if needs_reset:
 		_d("EP_END atk=%d" % _atk_presses)
+		# ★ 度量:在 env.reset_episode() 之前 end_episode(reset 会把角色归位,终止位置会丢)
+		#   只记真实终止(_pending_record),过滤 godot_rl reset 时序产生的伪局
+		if tele and _pending_record:
+			tele.end_episode({"term": _last_term,
+				"end_pos": [_last_end_pos.x, _last_end_pos.y]})
+		_pending_record = false
+		done = false         # ★ 清零,阻断 godot_rl reset 时序错配导致的伪局级联
 		env.reset_episode()
 		reset()              # 基类:n_steps=0, needs_reset=false
 		_init_trackers()
@@ -97,10 +114,15 @@ func _physics_process(_delta: float) -> void:
 
 	ep += 1
 	var p := _player
+	var _r_before := reward   # ★ 度量:帧初基线,帧末算本帧回报增量
 
 	# ★ FILL ★ 钩子 4a:稠密奖励(向目标推进 + 子技能塑形)
 	#   经验:稀疏大奖学不会硬探索动作 → 必须配「行为塑形」(如缺口边起跳+1、近敌挥砍+0.5)
 	# reward += ...
+
+	# ★ 度量:每帧采集本帧回报增量 + 位置(局长/回报/探索覆盖)
+	if tele:
+		tele.tick(reward - _r_before, p.global_position)
 
 	# ★ FILL ★ 钩子 4b:终止判定(到目标 +大奖 done;失败 -惩罚 done;超时 done)
 	#   经验:别用「全或无」门控锚定奖励,会摧毁前置技能。
@@ -111,4 +133,22 @@ func _physics_process(_delta: float) -> void:
 
 	# 关键:终止时必须自己置 needs_reset,下一帧才会走复位(否则 agent 死了不重生)
 	if done:
+		# ★ 度量:按真实终止条件设 term + 死亡事件;_real=false 表示 godot_rl 伪 done,不记
+		var _real := true
+		# ★ FILL ★ 按你的游戏终止条件分类(与上面钩子 4b 对应):
+		#   if reached_goal: _last_term = "goal"
+		#   elif fell:       _last_term = "fall"
+		#   elif hp_dead:    _last_term = "hp"
+		#   elif ep >= MAX_EP: _last_term = "timeout"
+		#   else: _real = false
+		if ep >= MAX_EP:
+			_last_term = "timeout"
+		else:
+			_real = false
+		if _real:
+			_last_end_pos = p.global_position
+			_pending_record = true
+			# 失败类终止 emit 死亡事件(死亡热点诊断):
+			#   if tele and (_last_term == "fall" or _last_term == "hp"):
+			#       tele.emit_event("death", {"pos": [p.global_position.x, p.global_position.y], "cause": _last_term})
 		needs_reset = true
