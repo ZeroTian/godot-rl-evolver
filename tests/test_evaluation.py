@@ -95,6 +95,21 @@ def test_validate_accepts_consistent_run(tmp_path):
     assert report["summary"]["n_episodes"] == 3
 
 
+def test_validate_thresholds_override_changes_issues(tmp_path):
+    """thresholds 覆盖能改变诊断结果(让闭环可调诊断灵敏度)。"""
+    p = tmp_path / "run_fall.jsonl"
+    _write_jsonl(p, scene="s", model="m", speedup=8, n_episodes=4, term="fall")
+    # 默认 hard_completion=0.10:全 fall → completion=0 < 0.10 → difficulty_too_hard 触发
+    rep_def, _ = evaluation.validate_telemetry(
+        str(p), scene="s", model="m", speedup=8, min_episodes=1)
+    assert any(i["id"] == "difficulty_too_hard" for i in rep_def["issues"])
+    # 覆盖 hard_completion=0.0:0 < 0 为假 → 不再触发
+    rep_thr, _ = evaluation.validate_telemetry(
+        str(p), scene="s", model="m", speedup=8, min_episodes=1,
+        thresholds={"hard_completion": 0.0})
+    assert not any(i["id"] == "difficulty_too_hard" for i in rep_thr["issues"])
+
+
 # ── paired_improvement:seed 集合必须完全相同 ─────────────────────────
 def _eval(scores_by_seed):
     """构造 EvaluationResult,scores_by_seed = {seed: score}。"""

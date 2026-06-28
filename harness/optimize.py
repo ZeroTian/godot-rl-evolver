@@ -116,6 +116,9 @@ class Config:
         # runs/<OPT_RUN_ID>/ 下(spec §4.2),否则二次运行会撞 run_one_seed 的「拒绝复用已存在
         # 目录」(固定路径 .artifacts/opt/baseline/seed_1 跨 run 冲突)。
         self.opt_run_id = os.environ.get("OPT_RUN_ID", "")
+        # 可选:覆盖 diagnose 默认阈值的 JSON(让闭环可调诊断灵敏度,如收紧 hard_completion)。
+        _thr = os.environ.get("THRESHOLDS", "")
+        self.thresholds = json.loads(_thr) if _thr.strip() else None
 
     def validate(self) -> None:
         """严格校验配对评估配置(spec §6/§7;非法即抛 ValueError)。
@@ -277,7 +280,7 @@ def run_one_seed(cfg: Config, *, seed: int, artifact_dir: str) -> evaluation.Run
     report, run_id = evaluation.validate_telemetry(
         telemetry_path,
         scene=cfg.scene, model=cfg.model, speedup=cfg.speedup,
-        min_episodes=cfg.eval_episodes)
+        min_episodes=cfg.eval_episodes, thresholds=cfg.thresholds)
 
     # ⑥ 算分 + 组 provenance(hash 来自启动前)。
     sc = objective.score(report, target=cfg.target_completion)

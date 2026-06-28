@@ -59,8 +59,10 @@ def sha256_file(path):
     return h.hexdigest()
 
 
-def validate_telemetry(path, *, scene, model, speedup, min_episodes):
+def validate_telemetry(path, *, scene, model, speedup, min_episodes, thresholds=None):
     """读 JSONL 首行校验 scene/model/speedup,诊断后校验局数与 run_id 绑定。
+
+    thresholds: 可选 dict,覆盖 diagnose 默认阈值(让闭环可调诊断灵敏度)。
 
     步骤:
     1. load_jsonl 取记录;首行必须是 type:"run"。
@@ -104,7 +106,7 @@ def validate_telemetry(path, *, scene, model, speedup, min_episodes):
                     % (ep_rid, header_run_id))
 
     agg = diagnose.aggregate(records)
-    issues = diagnose.diagnose(agg)
+    issues = diagnose.diagnose(agg, thresholds)
     report = diagnose.build_report(agg, issues)
 
     n_episodes = report["summary"]["n_episodes"]
