@@ -1,0 +1,17 @@
+{
+  "name": "default",
+  "reward_weights": {
+    "progress": 0.01,
+    "time_penalty": 0.002,
+    "damage": 0.1,
+    "kill": 25.0,
+    "combat_shape": 0.5,
+    "hurt_penalty": 0.5,
+    "gap_edge_jump": 1.0,
+    "gap_cross": 8.0,
+    "goal": 30.0,
+    "fall": 10.0,
+    "hp_fail": 10.0
+  },
+  "model": "~/.local/share/godot-rl-venv/ppo_game.zip"
+}
