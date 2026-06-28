@@ -154,6 +154,27 @@ PROJ=... SCENE=... MODEL=... ANTHROPIC_API_KEY=sk-... bash harness/run_optimize.
 > **LLM 后端**:`LLM_BACKEND=auto`(默认)有 `ANTHROPIC_API_KEY` 走 anthropic SDK,否则用本机
 > `claude` CLI(免 key);可显式设 `claude_cli`/`anthropic`。key 走环境变量,**绝不入库**。
 
+## 主观体验层(procedural personas)
+
+把"发现问题"从规则诊断的客观指标扩到**主观体验**,守业界三铁律:**相对而非绝对、对谁而非客观、
+发现优先不进锚**(设计 `docs/specs/2026-06-28-subjective-experience-layer-design.md`,
+调研 `.omc/research/2026-06-28-subjective-playtesting-signals.md`)。
+
+**personas = 一组风格各异的冻结策略**(好战/求稳/速通/探索),回答"这关**对谁**难、对谁无聊":
+- `personas/<name>.json` = reward-shaping profile(**冻结仪器面板**,优化闭环 protected 永不改)。
+- **校准**(算力步骤,模型不入库):对每个 persona 各跑一次
+  `PERSONA=aggressive MODEL=... SCENE=res://rl/train_map.tscn bash harness/run_train.sh`
+  (可 `WARM_START` 复用基线加速)→ 得到该 persona 的冻结策略。
+- **跑 panel**:`personas.run_persona_panel` 对一关逐 persona 试玩 → 每 persona 一份 report →
+  `diagnose.cross_persona_profile` 出体验剖面(谁最难、`difficulty_varies_by_persona` 等 soft issue)。
+
+> ⚠️ **关键(reward 训练/推理不对称)**:`infer_rl` 推理期**丢弃 reward**,故 persona reward 权重
+> **只在训练期塑形策略**,persona 差异 100% 来自加载哪个冻结模型。`game_agent.gd` 仅 `PERSONA` env
+> 非空时读权重,空则走字面默认(推理路径零回归)。
+> ⚠️ **跨 persona 只比 reward 无关量**(通关率/死亡位置/term/熵/覆盖);`progress_stall`/
+> `unstable_difficulty`(基于 return)被排除。**Goodhart 红线**:剖面 soft issue 标 `type:soft`、
+> **默认只进报告不进优化锚**(`has_high_issue` 忽略 soft;`personas/*.json` 受 protected)。
+
 ## 环境变量速查
 
 | 变量 | 默认 | 说明 |
@@ -165,6 +186,7 @@ PROJ=... SCENE=... MODEL=... ANTHROPIC_API_KEY=sk-... bash harness/run_optimize.
 | `TIMESTEPS` | 60000 | 训练步数 |
 | `SPEEDUP` | 8 | 加速倍率(训练/推理须一致) |
 | `WARM_START` | — | 热启动的旧模型路径 |
+| `PERSONA` | — | 训练期 persona 名;非空则 `game_agent.gd` 读 `personas/<PERSONA>.json` 的 reward 权重塑形该 persona(仅训练期生效) |
 | `SAVE_PATH` / `MODEL` | venv/ppo_game.zip | 模型保存 / 推理加载路径（**模型不入库**，须显式外部路径） |
 | `EVAL_SEED` | — | 单次评估随机种子；同时控制 Python/NumPy/PyTorch/SB3 + Godot `--env_seed` |
 | `EVAL_SEEDS` | `1,2,3` | 优化闭环每轮使用的种子列表（逗号分隔）；配对差值消除种子噪声 |

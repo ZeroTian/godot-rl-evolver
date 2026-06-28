@@ -2,7 +2,7 @@
 
 > 日期: 2026-06-28
 > 项目: godot-rl-evolver
-> 状态: 设计草案(待用户审定后再写实现计划)
+> 状态: 用户审定通过;**S2(procedural personas)机制已实现**(计划 `docs/plans/2026-06-28-subjective-personas-plan.md`,端到端验通);S1/S3(LLM 相对裁判)待建
 > 关联调研: `.omc/research/2026-06-28-subjective-playtesting-signals.md`
 > 定位: 把「发现问题」这条线从**客观规则诊断**(diagnose.py 的 8 条阈值)扩展到**主观体验**——
 > 在领域硬约束下做到「领域正解」:**相对而非绝对、对谁而非客观、发现优先而非直接进优化锚**。
