@@ -1,0 +1,54 @@
+{
+  "version": 1,
+  "params": {
+    "gap_width": {
+      "value": 120,
+      "range": [60, 200],
+      "type": "float",
+      "desc": "平台缺口宽度(px)，越大越难跨越",
+      "files": ["res://level.tscn"]
+    },
+    "enemy_hp": {
+      "value": 3,
+      "range": [1, 8],
+      "type": "int",
+      "desc": "敌人血量，值越大越难击杀",
+      "files": ["res://enemy.tscn"]
+    },
+    "jump_force": {
+      "value": 400,
+      "range": [300, 600],
+      "type": "float",
+      "desc": "玩家跳跃初速度(px/s)，影响可跨越的最大缺口",
+      "files": []
+    },
+    "reward_completion": {
+      "value": 10.0,
+      "range": [1.0, 50.0],
+      "type": "float",
+      "desc": "通关奖励系数，控制 RL agent 对完成关卡的重视程度",
+      "files": []
+    },
+    "reward_death_penalty": {
+      "value": -5.0,
+      "range": [-20.0, -0.5],
+      "type": "float",
+      "desc": "死亡惩罚系数（负数），影响 agent 的风险规避倾向",
+      "files": []
+    },
+    "enemy_speed": {
+      "value": 80,
+      "range": [30, 200],
+      "type": "float",
+      "desc": "敌人移动速度(px/s)，影响躲避难度",
+      "files": ["res://enemy.tscn"]
+    },
+    "platform_width": {
+      "value": 160,
+      "range": [80, 320],
+      "type": "float",
+      "desc": "平台宽度(px)，越小越难落脚",
+      "files": ["res://level.tscn"]
+    }
+  }
+}
