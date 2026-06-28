@@ -124,6 +124,56 @@ def test_smoke_gate_fails_when_no_episode(tmp_path, monkeypatch):
     assert detail
 
 
+# --------------------------------------------------------------------------- #
+# tscn_sanity(纯 Python .tscn 健全性,补 --import 对 .tscn 的失效)               #
+# --------------------------------------------------------------------------- #
+
+_GOOD_TSCN = (
+    '[gd_scene load_steps=2 format=3]\n\n'
+    '[sub_resource type="RectangleShape2D" id="plat_shape"]\n'
+    'size = Vector2(120, 24)\n\n'
+    '[node name="MidPlatform" type="StaticBody2D" parent="."]\n'
+    'position = Vector2(600, 40)\n\n'
+    '[node name="MidPlatShape" type="CollisionShape2D" parent="MidPlatform"]\n'
+    'shape = SubResource("plat_shape")\n'
+)
+
+
+def test_tscn_sanity_passes_on_valid(tmp_path):
+    p = tmp_path / "ok.tscn"
+    p.write_text(_GOOD_TSCN, encoding="utf-8")
+    ok, detail = gates.tscn_sanity([str(p)])
+    assert ok is True, detail
+
+
+def test_tscn_sanity_catches_unbalanced_paren(tmp_path):
+    """缺右括号的 Vector2 —— Godot --import 静默放过(实测 rc=0),纯检查必须抓。"""
+    p = tmp_path / "bad.tscn"
+    p.write_text(_GOOD_TSCN.replace("Vector2(600, 40)", "Vector2(600, 40"),
+                 encoding="utf-8")
+    ok, detail = gates.tscn_sanity([str(p)])
+    assert ok is False
+    assert "括号" in detail or "paren" in detail.lower()
+
+
+def test_tscn_sanity_catches_dangling_subresource(tmp_path):
+    """SubResource 引用了未定义的 id —— --import 也静默放过,纯检查必须抓。"""
+    p = tmp_path / "bad2.tscn"
+    p.write_text(_GOOD_TSCN.replace('SubResource("plat_shape")',
+                                    'SubResource("nope_xyz")'),
+                 encoding="utf-8")
+    ok, detail = gates.tscn_sanity([str(p)])
+    assert ok is False
+    assert "nope_xyz" in detail
+
+
+def test_tscn_sanity_skips_missing_and_non_tscn(tmp_path):
+    """不存在的文件 / 非 .tscn 路径直接跳过,返回 ok(不误伤注入式单测)。"""
+    ok, _ = gates.tscn_sanity([str(tmp_path / "ghost.tscn"),
+                               str(tmp_path / "x.json")])
+    assert ok is True
+
+
 def test_no_circular_import():
     """gates 与 optimize 可共存导入,无循环 import 崩溃(critic M3)。"""
     code = ("import sys; sys.path.insert(0, %r); import gates, optimize"

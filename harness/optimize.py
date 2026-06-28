@@ -674,6 +674,18 @@ def _run_structural_round(cfg, plan, paths, r, base, mem_path,
                     "apply failed: %s" % e))
         return base, None
 
+    # ①.5 .tscn 健全性(纯 Python,补 --import 对 .tscn 的失效:缺括号/悬空资源引用
+    #      Godot --import 会 rc=0 静默放过,甚至吞成默认值 → 看似过 gate 实则没改游戏)。
+    import gates as _gates
+    ok, detail = _gates.tscn_sanity(paths, cfg.repo_root)
+    if not ok:
+        mutate.rollback(snap, cfg.repo_root)
+        memory_mod.add_round(
+            mem_path, cfg.scene,
+            _record(r, plan, base.mean_score, base.mean_score, False,
+                    "syntax: tscn_sanity %s" % detail))
+        return base, None
+
     # ② 语法 gate(Godot --import)
     ok, detail = syntax_gate_fn(cfg)
     if not ok:

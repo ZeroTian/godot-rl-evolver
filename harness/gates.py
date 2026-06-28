@@ -19,6 +19,7 @@ Godot 可执行路径走 GODOT 环境变量(默认 /mnt/d/Godot/Godot_console.ex
 from __future__ import annotations
 
 import os
+import re
 import subprocess
 
 # 语法 gate 视为失败的标记(出现在 stdout/stderr 任一即判失败)
@@ -26,9 +27,55 @@ _SYNTAX_ERROR_MARKERS = ("SCRIPT ERROR", "Parse Error", "Failed to load script")
 
 _DEFAULT_GODOT = "/mnt/d/Godot/Godot_console.exe"
 
+# 含 ASCII 括号、需检查平衡的构造器(position/size/scale 等数值 patch 最常踩)
+_CTOR_TOKENS = ("Vector2(", "Vector2i(", "Vector3(", "Vector3i(",
+                "Rect2(", "Rect2i(", "Color(", "Transform2D(")
+_DEF_SUB = re.compile(r'\[sub_resource\b[^\]]*\bid="([^"]+)"')
+_DEF_EXT = re.compile(r'\[ext_resource\b[^\]]*\bid="([^"]+)"')
+_REF_SUB = re.compile(r'SubResource\("([^"]+)"\)')
+_REF_EXT = re.compile(r'ExtResource\("([^"]+)"\)')
+
 
 def _godot_bin() -> str:
     return os.environ.get("GODOT", _DEFAULT_GODOT)
+
+
+def tscn_sanity(paths, repo_root: str = ".") -> tuple[bool, str]:
+    """纯 Python 的 .tscn 健全性检查,补 Godot `--import` 对 .tscn 的失效。
+
+    实测:`--import` 对缺括号的 Vector2、悬空 SubResource 引用、错误 node type 一律
+    rc=0 且无标记静默放过 —— 坏 patch 会拖到 smoke gate 才暴露,甚至被 Godot 静默
+    用默认值吞掉(看似过 gate 实则没改游戏 → 测量隐患)。本检查在语法 gate 前廉价拦下
+    两类最常见的 patch 破坏:
+      ① 资源引用完整性:每个 SubResource("id")/ExtResource("id") 必须有对应定义;
+      ② 构造器括号平衡:含 Vector2(/Rect2(/Color( 等的行 ASCII '(' 与 ')' 数相等。
+
+    paths:repo-relative 或绝对路径列表;非 .tscn 或不存在的路径跳过(不误伤注入式单测)。
+    返回 (passed, detail)。
+    """
+    for p in paths:
+        if not str(p).endswith(".tscn"):
+            continue
+        full = p if os.path.isabs(p) else os.path.join(repo_root, p)
+        if not os.path.exists(full):
+            continue
+        with open(full, encoding="utf-8") as f:
+            text = f.read()
+
+        # ① 资源引用完整性
+        defined = set(_DEF_SUB.findall(text)) | set(_DEF_EXT.findall(text))
+        refs = set(_REF_SUB.findall(text)) | set(_REF_EXT.findall(text))
+        missing = sorted(refs - defined)
+        if missing:
+            return False, "%s: 未定义的资源引用 %s" % (p, missing)
+
+        # ② 构造器括号平衡
+        for i, line in enumerate(text.splitlines(), 1):
+            if any(tok in line for tok in _CTOR_TOKENS):
+                if line.count("(") != line.count(")"):
+                    return False, "%s:%d 括号不平衡: %s" % (p, i, line.strip())
+
+    return True, "tscn sanity ok"
 
 
 def syntax_gate(cfg) -> tuple[bool, str]:
