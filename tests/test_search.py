@@ -3,6 +3,7 @@
 用 mock evaluate(简单二次函数)断言能收敛到近最优点。
 """
 import search
+import evaluation
 
 
 def test_optimize_converges_quadratic_float():
@@ -58,3 +59,40 @@ def test_small_budget_falls_back_to_random():
     # best_score 应等于实际评估过的最小值
     assert abs(best_score - min(v for _, v in seen)) < 1e-9
     assert "x" in best
+
+
+def _mk_eval_result(score):
+    """构造一个单 seed 的 EvaluationResult,mean_score == score。"""
+    return evaluation.EvaluationResult((
+        evaluation.RunResult(seed=1, telemetry_path="x", run_id="r1",
+                             report={}, score=score, provenance={}),
+    ))
+
+
+def test_optimize_returns_best_evaluation_result_object():
+    """evaluate 返回 EvaluationResult 时:GP 用 mean_score 当标量,
+    optimize 返回 (best_point, best_EvaluationResult)。"""
+    space = [{"key": "x", "range": [0.0, 6.0], "type": "float"}]
+
+    def evaluate(point):
+        return _mk_eval_result((point["x"] - 3.0) ** 2)
+
+    best, best_value = search.optimize(space, evaluate, n_calls=15)
+    assert abs(best["x"] - 3.0) < 0.6
+    assert isinstance(best_value, evaluation.EvaluationResult)
+    assert best_value.mean_score < 0.5
+
+
+def test_optimize_returns_evaluation_result_small_budget():
+    """小预算随机退化路径同样返回最优点对应的 EvaluationResult。"""
+    space = [{"key": "x", "range": [0.0, 10.0], "type": "float"}]
+    seen = []
+
+    def evaluate(point):
+        r = _mk_eval_result((point["x"] - 5.0) ** 2)
+        seen.append(r.mean_score)
+        return r
+
+    best, best_value = search.optimize(space, evaluate, n_calls=5)
+    assert isinstance(best_value, evaluation.EvaluationResult)
+    assert abs(best_value.mean_score - min(seen)) < 1e-9
