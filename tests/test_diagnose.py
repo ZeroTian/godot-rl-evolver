@@ -160,8 +160,9 @@ def test_difficulty_too_easy():
 
 
 def test_death_hotspot():
-    # 一个格子远高于其他 → 触发
-    spike = {(1, 0): 1, (2, 0): 1, (3, 0): 1, (4, 0): 1, (5, 0): 40}
+    # 一个格子远高于其他 → 触发(多个低值格,使尖峰明显超 mean+2σ)
+    spike = {(i, 0): 1 for i in range(9)}
+    spike[(9, 0)] = 20
     assert "death_hotspot" in _ids(diagnose.diagnose(_agg(end_pos_grid=spike)))
     # 均匀分布 → 不触发
     flat = {(1, 0): 3, (2, 0): 3, (3, 0): 3, (4, 0): 3}
