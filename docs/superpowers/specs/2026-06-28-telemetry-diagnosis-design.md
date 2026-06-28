@@ -4,6 +4,9 @@
 > 项目: godot-rl-evolver
 > 状态: 设计已通过 brainstorming，待用户复审 → 转实施计划
 > 关联调研: `.omc/research/2026-06-28-rl-playtest-diagnosis.md`
+> 设计依据: 原项目 `godot-study/NOTES/07-rl-agent-training.md` 的 **7e 节「诊断闭环核心思想」**——
+> 本设计是其工具化实现。7e 列出 RL 能感知的四类信号:① 死亡位置热点 ② 奖励曲线平台期
+> ③ Done 原因分布 ④ 涌现策略 vs 设计意图。本设计覆盖 ①③④(见 §6),② 属训练期学习曲线信号,列为后续(见 §9)。
 
 ## 1. 背景与目标
 
@@ -98,6 +101,22 @@ JSON 记录 append 到 JSONL 文件 → 推理结束 helper flush → `diagnose.
 | `example_platformer/game_env.gd` | `_ready` 调 `tele.start_run(...)`，env 释放时 `tele.finish()`（按现有 env 生命周期接） |
 | `README.md` | 补「度量 + 诊断」章节 + 新环境变量（`DIAGNOSE`、`TELEMETRY_DIR`、`GRID_CELL`） |
 
+### 4.4 语义事件接入点（基于原 platformer 代码，已在 Step3 实跑验证）
+
+通用层零配置即可跑；语义事件让诊断更准。原 `godot-study/platformer` 现成接入点:
+
+| 语义信号 | 接入点 | emit 方式 |
+|---|---|---|
+| `term`（终止原因） | agent `_physics_process()` done 分支（GOAL/FALL/HP/ep>=MAX_EP） | `end_episode({"term": ...})`，仅在真实终止条件触发时（`_pending_record`） |
+| `death` | done 分支 fall/hp | `emit_event("death", {"pos": [...], "cause": "fall"/"hp"})` |
+| `kill` | monster `take_hit()`→`queue_free()`；env `monster_count()` 递减 | `emit_event("kill", {...})`（可选） |
+| `damage` | `player.health` 差值 | `set_metric("hp_left", env.player_hp())`（可选） |
+| `checkpoint` | agent `_crossed_gap`（x≥630）、GOAL_X | `emit_event("checkpoint", {...})`（可选） |
+
+> 关键坑（Step3 实测）：godot_rl reset 时序导致 `done` 未及时清零会产生 `len=1` 伪局。
+> 接入必须:① done 分支仅在真实条件（goal/fall/hp/ep>=MAX_EP）置 `_pending_record=true`；
+> ② reset 握手仅当 `_pending_record` 才 `end_episode`，并清 `done=false`。详见 §9。
+
 ## 5. 数据契约（Schema）
 
 ### 5.1 JSONL 采集格式（`telemetry/run_<ts>.jsonl`）
@@ -127,6 +146,7 @@ JSON 记录 append 到 JSONL 文件 → 推理结束 helper flush → `diagnose.
 ### 5.2 run 级聚合指标（`aggregate` 产出）
 
 - `n_episodes`、`completion_rate`（term=="goal" 或配置的 win 词占比）
+- `term_distribution`（各终止原因 goal/fall/hp/timeout/unknown 的占比 —— 对齐 7e 信号③）
 - `mean_len`、`mean_return`、`return_std`、`len_std`
 - `action_usage`（各维各档跨全 run 的平均占比）
 - `mean_action_entropy`、`mean_coverage_entropy`、`mean_cells`
@@ -157,9 +177,10 @@ JSON 记录 append 到 JSONL 文件 → 推理结束 helper flush → `diagnose.
 |---|---|---|---|---|
 | `difficulty_too_hard` | `completion_rate < 0.10` | high | tuning | 行业人类玩家锚点是 0.60；agent 弱，默认放宽，可配 |
 | `difficulty_too_easy` | `completion_rate > 0.90` 且 `mean_len < easy_len` | low | tuning | |
-| `death_hotspot` | 某网格终止/死亡数 `> mean + 2σ` | high | structural | 有语义 death 事件用之，否则用 `end_pos` 降级 |
-| `progress_stall` | `mean_len ≥ 0.9·max_ep` 且 `mean_return < stall_return` | medium | structural | agent 被卡住 |
-| `redundant_action` | 某动作档 `usage < 0.01` | medium | tuning | 只提示，勿暗示自动删（stepping-stone 警告） |
+| `death_hotspot` | 某网格终止/死亡数 `> mean + 2σ` | high | structural | 7e 信号①；有语义 death 事件用之，否则用 `end_pos` 降级 |
+| `done_reason_skew` | 某非通关 term 占比 `> dominant_term_frac` | high | structural | 7e 信号③；如「fall 占 63% → 缺口是难度尖峰」 |
+| `progress_stall` | `mean_len ≥ 0.9·max_ep` 且 `mean_return < stall_return` | medium | structural | agent 被卡住（7e 信号②推理期近似） |
+| `redundant_action` | 某动作档 `usage < 0.01` | medium | tuning | 7e 信号④；message 点明「可能学会绕过此机制」；只提示勿自动删（stepping-stone） |
 | `monotony` | `mean_action_entropy < ent_min` 或 `mean_coverage_entropy < cov_ent_min` | low | structural | 动作/空间单调 |
 | `unstable_difficulty` | `return_std / |mean_return|` 超阈值 | low | tuning | 运气/不稳定的体感粗信号 |
 
@@ -167,7 +188,8 @@ JSON 记录 append 到 JSONL 文件 → 推理结束 helper flush → `diagnose.
 ```python
 THRESHOLDS = {
   "hard_completion": 0.10, "easy_completion": 0.90, "easy_len_frac": 0.5,
-  "hotspot_sigma": 2.0, "stall_len_frac": 0.9, "stall_return": 0.0,
+  "hotspot_sigma": 2.0, "dominant_term_frac": 0.60,
+  "stall_len_frac": 0.9, "stall_return": 0.0,
   "redundant_usage": 0.01, "ent_min": 0.5, "cov_ent_min": 1.0,
   "unstable_cv": 1.5,
 }
@@ -198,4 +220,7 @@ THRESHOLDS = {
 - **平衡(balance)诊断弱**：真正的平衡度量需多策略/多角色对战数据；单 agent 单游戏下只能用「冗余动作/单调」近似。对战类游戏需求出现时再扩展 balance 规则（dominant strategy 检测等，见调研 §三）。
 - **熵阈值需经验校准**：`ent_min`/`cov_ent_min` 的合理值依游戏而异，初值可能误报/漏报；做成可配并在 README 说明如何按实际 run 调。
 - **death 语义依赖**：最有价值的死亡热点需游戏侧 emit `death` 事件；未 emit 时用 `end_pos` 降级，精度下降但不阻塞。
-- **JSONL 体积**：逐 event 可能在长 run 里变大；MVP 不做轮转，靠「event 仅按需 emit + episode 摘要为主」控制，必要时后续加文件轮转。
+- **JSONL 体积 / 不默认逐帧**：按调研里 EA SEED 的体积控制经验，默认只记 episode 摘要 + 按需语义 event，不每物理帧记一条；`telemetry.gd` 保留可选逐帧开关备用。MVP 不做文件轮转。
+- **2D 假设（本期范围）**：当前样例与控制器均为 `AIController2D`，`tick(pos)`/`end_pos`/覆盖网格均按 2D（`Vector2` + 单层网格）。3D 需升至 `Vector3` + 体素（调研 §SEED 配方），属后续；`diagnose.py` 只消费坐标数组，对维度无感知，无需改。
+- **7e 信号② 奖励平台期（后续）**：「奖励曲线长期不涨=此处有墙」是训练期学习曲线信号，本期采集时机以推理为主，未纳入；推理期用 `progress_stall` 近似。后续加训练期采集可读 SB3 `ep_rew_mean` 序列做平台期检测。
+- **godot_rl reset 时序坑（已在 Step3 实测并修复）**：godot_rl 的 reset 与每帧 `_physics_process` 不同步，`done` 未及时清零会在起点产生 `len=1` 伪局。接入时必须:① 仅真实终止条件才记录(`_pending_record`)；② 握手清 `done=false` 阻断级联。
