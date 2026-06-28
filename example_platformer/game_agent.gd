@@ -143,7 +143,10 @@ func _physics_process(_delta: float) -> void:
 		if tele and _pending_record:
 			tele.end_episode({"term": _last_term, "end_pos": [_last_end_pos.x, _last_end_pos.y], "max_x": _last_end_pos.x})
 		_pending_record = false
-		done = false        # 清零,阻断 godot_rl reset 时序错配导致的伪局级联
+		# done 保活:不在此清零,交给 Sync 控制步 _get_done_from_agents 读后 set_done_false。
+		# 否则 done 只活 1 物理帧、被 action_repeat 门控的 Sync 多半采样不到 → Python done 计数
+		# 与真实局数脱钩(~20x)。本版 godot_rl _reset_agents_if_done 已注释、基类 reset() 不动 done、
+		# telemetry 仅在 _pending_record 记录,故保活不复活伪局。
 		env.reset_episode()
 		reset()            # 基类：n_steps=0, needs_reset=false
 		_init_trackers()

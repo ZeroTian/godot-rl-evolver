@@ -85,10 +85,13 @@ episode 把指标落盘成 **JSONL**;`harness/diagnose.py` 离线读取、套可
 
 ## 必踩的坑(都在样例里踩过,改相关代码务必遵守)
 
-- **godot_rl reset 时序坑**:godot_rl 的 reset 与每帧 `_physics_process` 不同步,`done` 未及时
-  清零会在起点产生一串 `len=1` 的**伪局**污染数据。修复模式(`template/agent_template.gd` 已照做):
-  ① 仅**真实终止**(goal/fall/hp/超时)才置 `_pending_record=true`;② reset 握手里
-  `done=false`;③ `end_episode` 只在 `_pending_record` 时调用。
+- **godot_rl reset 时序坑 + done 保活**:telemetry 的局边界靠 `_pending_record`(仅**真实终止**
+  goal/fall/hp/超时才置真)+ `end_episode` 只在 `_pending_record` 时调用 —— 这保证 telemetry **永远**
+  不记 `len=1` 伪局,与 done 时序无关。**但 `done` 不要在 reset 握手里清零**(`done = false`):
+  `done` 只活 1 物理帧时,被 `action_repeat`(默认 8)门控的 Sync 多半采样不到 → Python 收到的 done
+  计数与真实局数**脱钩 ~20x**,`EVAL_EPISODES` 失效。正确做法是 **done 保活**:终止只置 `done=true`,
+  清零交给 Sync 控制步 `_get_done_from_agents` 读后 `set_done_false`(模板/样例/测试床已照做)。
+  适用前提(godot_rl_agents 默认满足):训练路径 `_reset_agents_if_done` 已注释、基类 `reset()` 不动 done。
 - **reset/done 握手**:godot_rl **不因 `done` 自动复位**,终止时必须自己也置 `needs_reset=true`,
   否则 agent 死了不重生、episode 卡死。
 - **训练/推理 `SPEEDUP` 必须一致**:策略绑在控制频率上(`speed_up=N` = 控制频率 ×N),不一致会
