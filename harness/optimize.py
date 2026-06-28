@@ -45,6 +45,10 @@ import evaluation
 
 DEFAULT_PROTECTED = "harness/**,.git/**,tests/**,docs/**"
 
+# 阶段1 唯一可提交的白名单路径(repo-relative)。结构/逻辑改动属阶段 2/3,
+# 阶段1 只允许写真实玩法参数,提交粒度固定到这一个文件。
+STAGE1_TUNABLES_REL = "testbed_platformer/rl/tunables.json"
+
 
 def _env_int(name: str, default: int) -> int:
     try:
@@ -108,6 +112,36 @@ class Config:
         self.min_improvement = _env_float("MIN_IMPROVEMENT", 0.1)
         self.artifact_root = os.environ.get(
             "ARTIFACT_ROOT", os.path.join(".artifacts", "opt"))
+
+    def validate(self) -> None:
+        """严格校验配对评估配置(spec §6/§7;非法即抛 ValueError)。
+
+        - eval_seeds: 非空、无重复整数。
+        - eval_episodes: > 0。
+        - max_eval_steps: >= eval_episodes(至少给每局一步)。
+        - eval_timeout_seconds: > 0。
+        - min_improvement: >= 0。
+        - artifact_root: 非空字符串。
+        """
+        seeds = tuple(self.eval_seeds)
+        if not seeds:
+            raise ValueError("eval_seeds 不能为空")
+        if len(set(seeds)) != len(seeds):
+            raise ValueError("eval_seeds 不能有重复: %r" % (seeds,))
+        if int(self.eval_episodes) <= 0:
+            raise ValueError("eval_episodes 必须 > 0: %r" % self.eval_episodes)
+        if int(self.max_eval_steps) < int(self.eval_episodes):
+            raise ValueError(
+                "max_eval_steps(%r) 必须 >= eval_episodes(%r)"
+                % (self.max_eval_steps, self.eval_episodes))
+        if int(self.eval_timeout_seconds) <= 0:
+            raise ValueError(
+                "eval_timeout_seconds 必须 > 0: %r" % self.eval_timeout_seconds)
+        if float(self.min_improvement) < 0:
+            raise ValueError(
+                "min_improvement 必须 >= 0: %r" % self.min_improvement)
+        if not self.artifact_root:
+            raise ValueError("artifact_root 不能为空")
 
 
 # --------------------------------------------------------------------------- #
@@ -298,143 +332,213 @@ def _point_id(point: dict) -> str:
 
 
 # --------------------------------------------------------------------------- #
-# 旧版评估器工厂(loop 当前仍用;Task 7 重写主循环后将被 make_evaluator 取代)   #
-# --------------------------------------------------------------------------- #
-
-def _make_legacy_evaluator(
-    cfg: Config,
-    playtest_fn: Callable[[Config], dict],
-) -> Callable[[dict], float]:
-    """构造贝叶斯 evaluate(point):写 tunables → 试玩诊断 → objective 算分。
-
-    point 是 {key: value} dict(由 search.optimize 映射好类型)。
-    每点评估返回标量分数(越小越好)。Task 7 用配对 make_evaluator 取代它。
-    """
-
-    def evaluate(point: dict) -> float:
-        for key, value in point.items():
-            mutate.apply_tunable(cfg.tunables_path, key, value)
-        report = playtest_fn(cfg)
-        return objective.score(
-            report, target=cfg.target_completion
-        )
-
-    return evaluate
-
-
-# --------------------------------------------------------------------------- #
 # 主循环                                                                        #
 # --------------------------------------------------------------------------- #
 
 def optimize_loop(
     cfg: Config,
     propose_fn: Optional[Callable] = None,
-    playtest_fn: Optional[Callable] = None,
+    evaluator_fn: Optional[Callable] = None,
+    baseline_fn: Optional[Callable] = None,
+    tracked_changes_fn: Optional[Callable] = None,
 ) -> dict:
-    """运行优化闭环,返回总结 dict。
+    """运行优化闭环(spec §7 主循环 + §6 三道 gate),返回总结 dict。
+
+    baseline 生命周期(原则:不复用磁盘旧 report):
+      - run 开始**必跑一次新 baseline 评估**(`baseline_fn`),绑定新 artifact;
+        绝不读 cfg.report_path 磁盘旧报告。
+      - 接受后 candidate(已验证 EvaluationResult)成为下一轮 baseline,
+        不重复评估同一点。
+      - 拒绝/失败后定向回滚白名单,baseline 不变(仍对应回滚后的 hash)。
+
+    接受门(spec §6 ③):`paired_improvement(base, candidate) > min_improvement`,
+    **严格大于**;等于阈值不接受。计分日志先存 `prev = base.mean_score` 再赋值
+    `base = candidate`,reason 用 prev→candidate.mean_score(不得 X→X)。
 
     Args:
-        cfg:         配置。
-        propose_fn:  LLM 提案函数,签名 (report, tunables, memory, stage)->plan。
-                     默认 llm_propose.propose;测试可注入桩。
-        playtest_fn: 试玩+诊断函数,签名 (cfg)->report。默认 run_playtest_and_diagnose;
-                     测试可注入桩报告。
+        cfg:               配置(进入前已 validate)。
+        propose_fn:        LLM 提案,签名 (report, tunables, memory, stage)->plan。
+        evaluator_fn:      贝叶斯每点评估,签名 (point)->EvaluationResult。
+                           默认 make_evaluator(cfg)。
+        baseline_fn:       baseline 评估,签名 (cfg)->EvaluationResult。
+                           默认 evaluate_current(cfg, point_id="baseline")。
+        tracked_changes_fn:Gate 0b,签名 (cfg)->list[str];返回白名单外的 tracked
+                           改动路径,非空则立即中止本 run。默认探测 git。
 
     返回总结:{"accepted": [...], "base_score": float, "rounds": int,
-              "final_report": dict}
+              "final_report": dict, "aborted": bool}
     """
+    cfg.validate()
+
     propose_fn = propose_fn or (
         lambda report, tunables, mem, stage: llm_propose.propose(
             report, tunables, mem, stage
         )
     )
-    playtest_fn = playtest_fn or run_playtest_and_diagnose
+    evaluator_fn = evaluator_fn or make_evaluator(cfg)
+    baseline_fn = baseline_fn or (
+        lambda c: evaluate_current(c, point_id="baseline"))
+    tracked_changes_fn = tracked_changes_fn or _default_tracked_changes
 
-    # baseline:已有 report 就用,否则跑一次试玩诊断
-    if os.path.exists(cfg.report_path):
-        report = _load_json(cfg.report_path)
-    else:
-        report = playtest_fn(cfg)
+    mem_path = _memory_path_for(cfg)
 
-    base_score = objective.score(report, target=cfg.target_completion)
+    # baseline:run 开始必跑一次新评估,绝不读磁盘旧 report(原则:新鲜 baseline)。
+    base = baseline_fn(cfg)
     no_improve = 0
     accepted: list[dict] = []
+    aborted = False
+    r = -1
 
     for r in range(cfg.max_rounds):
+        report = base.representative_report
         # 早停:无 high issue / 连续无改善达 PATIENCE
         if not has_high_issue(report) or no_improve >= cfg.patience:
             break
 
+        # Gate 0b(每轮边界):白名单外出现 tracked 改动 → 立即中止整个 run。
+        outside = tracked_changes_fn(cfg)
+        if outside:
+            aborted = True
+            memory_mod.add_round(
+                mem_path, cfg.scene,
+                _record(r, {}, base.mean_score, base.mean_score, False,
+                        "aborted: 白名单外 tracked 改动 %s" % outside),
+            )
+            break
+
         tunables = _load_json(cfg.tunables_path)
-        mem = memory_mod.load(cfg.memory_path)
+        mem = memory_mod.load(mem_path)
         plan = propose_fn(report, tunables, mem, cfg.stage)
 
-        snap = mutate.snapshot(cfg.repo_root)
-
-        # protected 入口:命中则拒绝并记 memory
+        # protected + 参数边界入口:命中则拒绝并记 memory(不快照/不搜索)。
         if not mutate.allowed(plan, cfg.protected_paths):
             memory_mod.add_round(
-                cfg.memory_path, cfg.scene,
-                _record(r, plan, base_score, base_score, False, "protected path"),
+                mem_path, cfg.scene,
+                _record(r, plan, base.mean_score, base.mean_score, False,
+                        "protected path"),
             )
             no_improve += 1
             continue
+
+        # 本轮白名单:阶段1 固定为唯一的 tunables.json(repo-relative)。
+        paths = [STAGE1_TUNABLES_REL]
+        snap = mutate.snapshot(paths, cfg.repo_root)
 
         change_type = plan.get("change_type")
-
-        if change_type == "tunable_search":
-            # 贝叶斯内循环:每点评估隐含过 smoke + 指标(评估即试玩算分)。
-            # 数值改动天然过语法 gate(不碰代码)。
-            evaluate = _make_legacy_evaluator(cfg, playtest_fn)
-            search_space = _normalize_search_space(plan["search_space"], tunables)
-            best_point, best_score = search.optimize(
-                search_space, evaluate, n_calls=cfg.search_calls
-            )
-            # 把最优点写回 tunables(贝叶斯最后一次评估未必是最优点)
-            for key, value in best_point.items():
-                mutate.apply_tunable(cfg.tunables_path, key, value)
-            new_report = playtest_fn(cfg)
-            new_score = objective.score(new_report, target=cfg.target_completion)
-            summary = _summarize_point(best_point)
-        else:
-            # 阶段 2/3:structural / logic。阶段1不处理 → 回滚跳过。
+        if change_type != "tunable_search":
+            # 阶段 2/3:structural / logic。阶段1不处理 → 定向回滚跳过。
             mutate.rollback(snap, cfg.repo_root)
             memory_mod.add_round(
-                cfg.memory_path, cfg.scene,
-                _record(r, plan, base_score, base_score, False,
-                        f"change_type={change_type} 不在阶段{cfg.stage}范围"),
+                mem_path, cfg.scene,
+                _record(r, plan, base.mean_score, base.mean_score, False,
+                        f"unsupported change type={change_type}"),
             )
             no_improve += 1
             continue
 
-        # 指标 gate:真变好(分数更小)才接受
-        if new_score < base_score:
-            mutate.commit(f"opt r{r}: {summary}", cfg.repo_root)
-            memory_mod.add_round(
-                cfg.memory_path, cfg.scene,
-                _record(r, plan, base_score, new_score, True,
-                        f"score {base_score:.3f}→{new_score:.3f}"),
-            )
-            accepted.append({"round": r, "summary": summary,
-                             "score_before": base_score, "score_after": new_score})
-            base_score = new_score
-            report = new_report
-            no_improve = 0
-        else:
+        # 贝叶斯内循环:返回最优点 + 对应 candidate(EvaluationResult)。
+        # 评估失败(0/多个 JSONL、局数不足、超时等)会从 evaluator 抛出 → 记失败回滚。
+        search_space = _normalize_search_space(plan["search_space"], tunables)
+        try:
+            best_point, candidate = search.optimize(
+                search_space, evaluator_fn, n_calls=cfg.search_calls)
+            improvement = evaluation.paired_improvement(base, candidate)
+        except (RuntimeError, ValueError) as e:
             mutate.rollback(snap, cfg.repo_root)
             memory_mod.add_round(
-                cfg.memory_path, cfg.scene,
-                _record(r, plan, base_score, new_score, False,
+                mem_path, cfg.scene,
+                _record(r, plan, base.mean_score, base.mean_score, False,
+                        "evaluation failed: %s" % e),
+            )
+            no_improve += 1
+            continue
+
+        summary = _summarize_point(best_point)
+
+        # 指标 gate(③):配对改善严格大于阈值才接受。
+        if improvement > cfg.min_improvement:
+            # 把最优点写回 tunables(贝叶斯最后评估点未必最优),再提交白名单。
+            for key, value in best_point.items():
+                mutate.apply_tunable(cfg.tunables_path, key, value)
+            prev = base.mean_score                       # 先存 prev,再赋值(防 X→X)
+            mutate.commit(f"opt r{r}: {summary}", paths, cfg.repo_root)
+            after = candidate.mean_score
+            memory_mod.add_round(
+                mem_path, cfg.scene,
+                _record(r, plan, prev, after, True,
+                        f"score {prev:.3f}→{after:.3f}"),
+            )
+            accepted.append({"round": r, "summary": summary,
+                             "score_before": prev, "score_after": after})
+            base = candidate                             # 已验证候选成为下一轮 baseline
+            no_improve = 0
+        else:
+            mutate.rollback(snap, cfg.repo_root)         # 定向回滚白名单,不动其它文件
+            memory_mod.add_round(
+                mem_path, cfg.scene,
+                _record(r, plan, base.mean_score, candidate.mean_score, False,
                         "no score improvement"),
             )
             no_improve += 1
 
     return {
         "accepted": accepted,
-        "base_score": base_score,
+        "base_score": base.mean_score,
         "rounds": r + 1 if cfg.max_rounds else 0,
-        "final_report": report,
+        "final_report": base.representative_report,
+        "aborted": aborted,
     }
+
+
+# --------------------------------------------------------------------------- #
+# baseline 生命周期辅助                                                          #
+# --------------------------------------------------------------------------- #
+
+def _scene_hash(scene: str) -> str:
+    """scene 字符串的稳定短 hash,用作 memory 文件名(每场景独立记忆)。"""
+    import hashlib
+    return hashlib.sha256((scene or "").encode("utf-8")).hexdigest()[:12]
+
+
+def _memory_path_for(cfg: Config) -> str:
+    """memory 落盘路径:`<artifact_root>/memory/<scene-hash>.json`(不进 commit)。
+
+    显式 MEMORY_PATH 环境变量(非默认值)优先;否则按 scene-hash 放进 artifact。
+    """
+    explicit = os.environ.get("MEMORY_PATH")
+    if explicit:
+        return explicit
+    mem_dir = os.path.join(cfg.artifact_root, "memory")
+    os.makedirs(mem_dir, exist_ok=True)
+    return os.path.join(mem_dir, "%s.json" % _scene_hash(cfg.scene))
+
+
+def _default_tracked_changes(cfg: Config) -> list:
+    """Gate 0b 默认实现:列出工作树里白名单之外的 tracked 改动路径。
+
+    用 `git status --porcelain` 取改动文件,过滤掉阶段1 白名单与被忽略的
+    `.artifacts/`。任何残留(代码/场景/其它 tracked)即视为越界,返回非空。
+    失败(非 git 仓等)时返回空,交由上层默认放行(单测均显式注入此钩子)。
+    """
+    try:
+        out = subprocess.run(
+            ["git", "status", "--porcelain"],
+            cwd=cfg.repo_root, capture_output=True, text=True, check=False)
+    except (OSError, ValueError):
+        return []
+    if out.returncode != 0:
+        return []
+    changed = []
+    for line in out.stdout.splitlines():
+        if not line.strip():
+            continue
+        path = line[3:].strip()
+        if path == STAGE1_TUNABLES_REL:
+            continue
+        if path.startswith(".artifacts/"):
+            continue
+        changed.append(path)
+    return changed
 
 
 # --------------------------------------------------------------------------- #

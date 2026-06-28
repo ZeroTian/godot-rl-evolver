@@ -1,10 +1,15 @@
-"""optimize.py 编排器集成测试(计划 AC5)。
+"""optimize.py 编排器集成测试(计划 Task 4 + Task 7)。
 
-验证三道 gate 的「指标回归」+ 回滚 + 记忆:
-- 劣化改动(score 变差)→ git 回滚 + memory 记 accepted:false,不接受。
-- 改善改动(score 变好)→ commit 接受 + memory 记 accepted:true。
+Task 7 验证主循环 baseline 生命周期与接受门:
+- run 开始必跑**新** baseline(EvaluationResult),不读磁盘旧 REPORT_PATH。
+- 接受后 candidate 成为下一轮 baseline,不重复跑同一点。
+- 拒绝后 tunables **定向回滚**白名单,baseline 仍对应回滚后的 hash。
+- seed 集不一致 / 局数不足 / 0或多个 JSONL → 记失败且不计分。
+- 改善**等于**阈值不接受,**严格大于** min_improvement 才接受。
+- memory reason 用赋值前后真实 mean_score,不得出现 X→X。
+- 每轮边界出现白名单外 tracked 改动立即中止。
 
-git(snapshot/rollback/commit)与试玩(playtest_fn)均 mock/桩,不真跑 Godot/git。
+git(snapshot/rollback/commit)、试玩(evaluator/baseline)均 mock/桩,不真跑 Godot/git。
 """
 import json
 import os
@@ -26,131 +31,404 @@ def _write(p, obj):
     p.write_text(json.dumps(obj), encoding="utf-8")
 
 
-def _make_cfg(tmp_path, base_report):
-    """构造一个隔离的 Config:tmp 路径 + 单轮。"""
+# --------------------------------------------------------------------------- #
+# Task 7 主循环测试脚手架                                                       #
+# --------------------------------------------------------------------------- #
+
+# 一个有 high issue 的代表性报告(进循环的前提:有 high issue 才提案)
+_REP_HIGH = {
+    "summary": {"completion_rate": 0.04, "n_episodes": 20},
+    "issues": [{"id": "difficulty_too_hard", "severity": "high"}],
+}
+# 无 issue 的报告(用于停止条件)
+_REP_CLEAN = {"summary": {"completion_rate": 0.66, "n_episodes": 20}, "issues": []}
+
+_PLAN = {
+    "change_type": "tunable_search",
+    "target_issue": "difficulty_too_hard",
+    "search_space": [{"key": "enemy_hp", "range": [20, 60]}],
+    "files": ["res://rl/game_env.gd"],
+    "expected_effect": "降低难度提高通关率",
+}
+
+
+def _eval_result(*, mean, report=_REP_HIGH, seeds=(1, 2, 3)):
+    """构造一个 mean_score == `mean` 的 EvaluationResult(各 seed 同分,便于配对推断)。"""
+    runs = tuple(
+        evaluation.RunResult(
+            seed=s, telemetry_path="t%d" % s, run_id="r%d" % s,
+            report=report, score=float(mean), provenance={})
+        for s in seeds
+    )
+    return evaluation.EvaluationResult(runs)
+
+
+def _loop_cfg(tmp_path):
+    """主循环用 Config:隔离 tmp 路径、单/少轮、stage 1。"""
     tun = tmp_path / "tunables.json"
     _write(tun, {"version": 1, "params": {
-        "gap_width": {"value": 120, "range": [80, 160], "type": "float", "desc": "缺口"},
+        "enemy_hp": {"value": 40, "range": [20, 100], "type": "int",
+                     "desc": "hp", "files": ["res://rl/game_env.gd"]},
     }})
-    rep = tmp_path / "report.json"
-    _write(rep, base_report)
-
     cfg = optimize.Config()
     cfg.tunables_path = str(tun)
-    cfg.report_path = str(rep)
-    cfg.memory_path = str(tmp_path / "memory.json")
-    cfg.scene = "res://test.tscn"
+    cfg.report_path = str(tmp_path / "report.json")  # 故意指向(可能存在的)旧报告
+    cfg.scene = "res://rl/train.tscn"
     cfg.max_rounds = 1
     cfg.patience = 3
     cfg.stage = 1
     cfg.target_completion = 0.65
     cfg.repo_root = str(tmp_path)
+    cfg.eval_seeds = (1, 2, 3)
+    cfg.eval_episodes = 20
+    cfg.max_eval_steps = 40000
+    cfg.eval_timeout_seconds = 30
+    cfg.min_improvement = 0.1
+    cfg.artifact_root = str(tmp_path / ".artifacts" / "opt")
     return cfg
 
 
-def _patch_git_and_search(monkeypatch, best_point):
-    """mock git 副作用 + search.optimize;返回 calls 计数器。"""
-    calls = {"rollback": 0, "commit": 0, "snapshot": 0}
-    monkeypatch.setattr(mutate, "snapshot",
-                        lambda root=".": calls.__setitem__("snapshot", calls["snapshot"] + 1) or "SNAP")
+def _patch_git(monkeypatch):
+    """mock 白名单 git 副作用,返回 calls 记录(含传入路径)。"""
+    calls = {"snapshot": [], "rollback": 0, "commit": []}
+
+    def _snap(paths, repo_root="."):
+        calls["snapshot"].append(list(paths))
+        return {"SNAP": b""}
+
+    monkeypatch.setattr(mutate, "snapshot", _snap)
     monkeypatch.setattr(mutate, "allowed", lambda plan, protected: True)
     monkeypatch.setattr(mutate, "apply_tunable", lambda path, k, v: None)
     monkeypatch.setattr(mutate, "rollback",
-                        lambda snap, root=".": calls.__setitem__("rollback", calls["rollback"] + 1))
+                        lambda snap, repo_root=".": calls.__setitem__(
+                            "rollback", calls["rollback"] + 1))
     monkeypatch.setattr(mutate, "commit",
-                        lambda msg, root=".": calls.__setitem__("commit", calls["commit"] + 1))
-    monkeypatch.setattr(search, "optimize",
-                        lambda space, ev, n_calls: (best_point, 0.0))
+                        lambda msg, paths, repo_root=".": calls["commit"].append(
+                            list(paths)))
     return calls
 
 
-# 有 high issue 的 baseline(进循环)+ 低通关率 → score 较高
-_BASE = {
-    "summary": {"completion_rate": 0.04},
-    "issues": [{"id": "difficulty_too_hard", "severity": "high"}],
-}
-
-_PLAN = {
-    "change_type": "tunable_search",
-    "target_issue": "difficulty_too_hard",
-    "search_space": [{"key": "gap_width", "range": [100, 160]}],
-    "expected_effect": "提高通关率",
-}
+def _read_mem(cfg):
+    path = optimize._memory_path_for(cfg)
+    return json.loads(open(path, encoding="utf-8").read())
 
 
-def test_degrading_change_is_rolled_back(tmp_path, monkeypatch):
-    cfg = _make_cfg(tmp_path, _BASE)
-    calls = _patch_git_and_search(monkeypatch, {"gap_width": 150.0})
+def test_run_start_evaluates_fresh_baseline_not_disk_report(tmp_path, monkeypatch):
+    """run 开始必调用一次新 baseline 评估,绝不读取磁盘旧 REPORT_PATH。"""
+    cfg = _loop_cfg(tmp_path)
+    # 在磁盘预置一份"旧报告" —— 若循环误读它就算回归
+    _write(tmp_path / "report.json", {"summary": {"completion_rate": 0.99,
+                                                   "n_episodes": 20},
+                                      "issues": []})
+    _patch_git(monkeypatch)
 
-    # 劣化:通关率更低 + 多一个 high issue → score 更大(更差)
-    worse = {"summary": {"completion_rate": 0.02},
-             "issues": [{"id": "difficulty_too_hard", "severity": "high"},
-                        {"id": "death_hotspot", "severity": "high"}]}
+    baseline_calls = {"n": 0}
+
+    def _baseline(c):
+        baseline_calls["n"] += 1
+        return _eval_result(mean=5.0)
+
+    # 不进搜索:让 baseline 无 high issue 以外的逻辑 —— 这里 baseline 有 high issue,
+    # 但我们让 propose 抛出以确认"先评估 baseline"已发生即可。
+    monkeypatch.setattr(search, "optimize",
+                        lambda space, ev, n_calls: ({"enemy_hp": 30},
+                                                    _eval_result(mean=5.0)))
 
     summary = optimize.optimize_loop(
         cfg,
-        propose_fn=lambda report, tunables, mem, stage: _PLAN,
-        playtest_fn=lambda c: worse,
+        propose_fn=lambda rep, tun, mem, stage: _PLAN,
+        baseline_fn=_baseline,
+        evaluator_fn=lambda point: _eval_result(mean=5.0),
+        tracked_changes_fn=lambda c: [],
+    )
+
+    assert baseline_calls["n"] == 1
+    # 不依赖磁盘旧 report:base_score 应来自 _baseline(=5.0),不是 0.99 报告算出的分
+    assert summary["base_score"] == pytest.approx(5.0)
+
+
+def test_accepted_candidate_becomes_next_baseline(tmp_path, monkeypatch):
+    """接受后 candidate 成为下一轮 baseline,不重复评估同一点。"""
+    cfg = _loop_cfg(tmp_path)
+    cfg.max_rounds = 2
+    calls = _patch_git(monkeypatch)
+
+    # baseline 只在 run 开始评估一次
+    baseline_calls = {"n": 0}
+
+    def _baseline(c):
+        baseline_calls["n"] += 1
+        return _eval_result(mean=5.0, report=_REP_HIGH)
+
+    # 第一轮 candidate 明显更好(mean 1.0,改善 4.0 > 0.1);第二轮 candidate 也更好
+    cand_means = iter([1.0, 0.5])
+    cand_reports = iter([_REP_HIGH, _REP_HIGH])
+
+    def _search(space, ev, n_calls):
+        return ({"enemy_hp": 30},
+                _eval_result(mean=next(cand_means), report=next(cand_reports)))
+
+    monkeypatch.setattr(search, "optimize", _search)
+
+    summary = optimize.optimize_loop(
+        cfg,
+        propose_fn=lambda rep, tun, mem, stage: _PLAN,
+        baseline_fn=_baseline,
+        evaluator_fn=lambda point: _eval_result(mean=1.0),
+        tracked_changes_fn=lambda c: [],
+    )
+
+    assert baseline_calls["n"] == 1          # baseline 只 run 开始评估一次
+    assert len(calls["commit"]) == 2         # 两轮都接受
+    assert len(summary["accepted"]) == 2
+    # 第二轮的 score_before 应等于第一轮接受后的 mean(=1.0),证明 candidate 成了 baseline
+    assert summary["accepted"][1]["score_before"] == pytest.approx(1.0)
+    assert summary["accepted"][1]["score_after"] == pytest.approx(0.5)
+
+
+def test_rejected_change_is_targeted_rolled_back(tmp_path, monkeypatch):
+    """拒绝后定向回滚白名单,baseline 不变(仍对应回滚后的 hash)。"""
+    cfg = _loop_cfg(tmp_path)
+    calls = _patch_git(monkeypatch)
+
+    def _baseline(c):
+        return _eval_result(mean=5.0)
+
+    # candidate 不够好(mean 4.95,改善 0.05 < 0.1)→ 拒绝
+    monkeypatch.setattr(search, "optimize",
+                        lambda space, ev, n_calls: ({"enemy_hp": 30},
+                                                    _eval_result(mean=4.95)))
+
+    summary = optimize.optimize_loop(
+        cfg,
+        propose_fn=lambda rep, tun, mem, stage: _PLAN,
+        baseline_fn=_baseline,
+        evaluator_fn=lambda point: _eval_result(mean=4.95),
+        tracked_changes_fn=lambda c: [],
     )
 
     assert calls["rollback"] == 1
-    assert calls["commit"] == 0
+    assert calls["commit"] == []
     assert summary["accepted"] == []
+    # 回滚后 baseline 仍是原 baseline(mean 5.0)
+    assert summary["base_score"] == pytest.approx(5.0)
+    # snapshot 应传白名单路径列表(阶段1 = testbed_platformer/rl/tunables.json)
+    assert calls["snapshot"], "应对白名单路径快照"
+    assert any("tunables.json" in p for plist in calls["snapshot"] for p in plist)
 
-    mem = json.loads((tmp_path / "memory.json").read_text())
-    rounds = mem["rounds"]
-    assert len(rounds) == 1
-    assert rounds[0]["accepted"] is False
-    assert "no score improvement" in rounds[0]["reason"]
 
+def test_improvement_equal_to_threshold_is_rejected(tmp_path, monkeypatch):
+    """改善**等于** min_improvement 不接受;严格大于才接受(严格不等号边界)。"""
+    cfg = _loop_cfg(tmp_path)
+    cfg.min_improvement = 0.5
+    calls = _patch_git(monkeypatch)
 
-def test_improving_change_is_committed(tmp_path, monkeypatch):
-    cfg = _make_cfg(tmp_path, _BASE)
-    calls = _patch_git_and_search(monkeypatch, {"gap_width": 110.0})
-
-    # 改善:通关率接近 target + 无 issue → score 更小(更好)
-    better = {"summary": {"completion_rate": 0.66}, "issues": []}
+    # baseline 5.0,candidate 4.5 → paired_improvement = 0.5 == 阈值 → 不接受
+    monkeypatch.setattr(search, "optimize",
+                        lambda space, ev, n_calls: ({"enemy_hp": 30},
+                                                    _eval_result(mean=4.5)))
 
     summary = optimize.optimize_loop(
         cfg,
-        propose_fn=lambda report, tunables, mem, stage: _PLAN,
-        playtest_fn=lambda c: better,
+        propose_fn=lambda rep, tun, mem, stage: _PLAN,
+        baseline_fn=lambda c: _eval_result(mean=5.0),
+        evaluator_fn=lambda point: _eval_result(mean=4.5),
+        tracked_changes_fn=lambda c: [],
     )
 
-    assert calls["commit"] == 1
+    assert calls["commit"] == []
+    assert calls["rollback"] == 1
+    assert summary["accepted"] == []
+
+
+def test_improvement_strictly_above_threshold_is_accepted(tmp_path, monkeypatch):
+    """改善严格大于阈值才接受。"""
+    cfg = _loop_cfg(tmp_path)
+    cfg.min_improvement = 0.5
+    calls = _patch_git(monkeypatch)
+
+    # baseline 5.0,candidate 4.49 → improvement 0.51 > 0.5 → 接受
+    monkeypatch.setattr(search, "optimize",
+                        lambda space, ev, n_calls: ({"enemy_hp": 30},
+                                                    _eval_result(mean=4.49)))
+
+    summary = optimize.optimize_loop(
+        cfg,
+        propose_fn=lambda rep, tun, mem, stage: _PLAN,
+        baseline_fn=lambda c: _eval_result(mean=5.0),
+        evaluator_fn=lambda point: _eval_result(mean=4.49),
+        tracked_changes_fn=lambda c: [],
+    )
+
+    assert len(calls["commit"]) == 1
     assert calls["rollback"] == 0
     assert len(summary["accepted"]) == 1
-    assert summary["accepted"][0]["score_after"] < summary["accepted"][0]["score_before"]
 
-    mem = json.loads((tmp_path / "memory.json").read_text())
+
+def test_memory_reason_uses_real_scores_no_x_to_x(tmp_path, monkeypatch):
+    """memory reason 用赋值前后真实 mean_score,不得出现 X→X。"""
+    cfg = _loop_cfg(tmp_path)
+    _patch_git(monkeypatch)
+
+    monkeypatch.setattr(search, "optimize",
+                        lambda space, ev, n_calls: ({"enemy_hp": 30},
+                                                    _eval_result(mean=1.0)))
+
+    optimize.optimize_loop(
+        cfg,
+        propose_fn=lambda rep, tun, mem, stage: _PLAN,
+        baseline_fn=lambda c: _eval_result(mean=5.0),
+        evaluator_fn=lambda point: _eval_result(mean=1.0),
+        tracked_changes_fn=lambda c: [],
+    )
+
+    mem = _read_mem(cfg)
+    reason = mem["rounds"][0]["reason"]
     assert mem["rounds"][0]["accepted"] is True
+    # reason 须含真实的 5.x→1.x,且 prev != after(不得 X→X)
+    import re
+    nums = re.findall(r"\d+\.\d+", reason)
+    assert len(nums) >= 2, "reason 应含前后两个分数: %r" % reason
+    assert nums[0] != nums[1], "不得出现 X→X: %r" % reason
+    assert float(nums[0]) == pytest.approx(5.0)
+    assert float(nums[1]) == pytest.approx(1.0)
 
 
-def test_protected_path_change_rejected(tmp_path, monkeypatch):
-    """命中 protected 的改动被拒绝并记 memory(不进搜索/试玩)。"""
-    cfg = _make_cfg(tmp_path, _BASE)
-    calls = _patch_git_and_search(monkeypatch, {"gap_width": 110.0})
-    # 覆盖 allowed → False(模拟命中 protected)
-    monkeypatch.setattr(mutate, "allowed", lambda plan, protected: False)
+def test_seed_set_mismatch_records_failure_no_score(tmp_path, monkeypatch):
+    """candidate 与 baseline seed 集不一致 → paired_improvement 抛错 → 记失败不计分。"""
+    cfg = _loop_cfg(tmp_path)
+    calls = _patch_git(monkeypatch)
 
-    played = {"n": 0}
-
-    def _playtest(c):
-        played["n"] += 1
-        return _BASE
+    # candidate 用不同 seed 集 {1,2,4} vs baseline {1,2,3}
+    bad_cand = _eval_result(mean=1.0, seeds=(1, 2, 4))
+    monkeypatch.setattr(search, "optimize",
+                        lambda space, ev, n_calls: ({"enemy_hp": 30}, bad_cand))
 
     summary = optimize.optimize_loop(
         cfg,
-        propose_fn=lambda report, tunables, mem, stage: _PLAN,
-        playtest_fn=_playtest,
+        propose_fn=lambda rep, tun, mem, stage: _PLAN,
+        baseline_fn=lambda c: _eval_result(mean=5.0, seeds=(1, 2, 3)),
+        evaluator_fn=lambda point: bad_cand,
+        tracked_changes_fn=lambda c: [],
     )
 
-    assert played["n"] == 0          # protected 拒绝,不应试玩
-    assert calls["commit"] == 0
+    assert calls["commit"] == []
+    assert calls["rollback"] == 1            # 失败也要回滚白名单
     assert summary["accepted"] == []
-    mem = json.loads((tmp_path / "memory.json").read_text())
+    mem = _read_mem(cfg)
     assert mem["rounds"][0]["accepted"] is False
-    assert "protected" in mem["rounds"][0]["reason"]
+
+
+def test_evaluation_error_records_failure_no_score(tmp_path, monkeypatch):
+    """评估抛错(0/多个 JSONL、局数不足等) → 记失败且不计分,定向回滚。"""
+    cfg = _loop_cfg(tmp_path)
+    calls = _patch_git(monkeypatch)
+
+    def _search(space, ev, n_calls):
+        raise RuntimeError("seed=1 期望恰好 1 个 run_*.jsonl,实际 0 个")
+
+    monkeypatch.setattr(search, "optimize", _search)
+
+    summary = optimize.optimize_loop(
+        cfg,
+        propose_fn=lambda rep, tun, mem, stage: _PLAN,
+        baseline_fn=lambda c: _eval_result(mean=5.0),
+        evaluator_fn=lambda point: _eval_result(mean=1.0),
+        tracked_changes_fn=lambda c: [],
+    )
+
+    assert calls["commit"] == []
+    assert calls["rollback"] == 1
+    assert summary["accepted"] == []
+    mem = _read_mem(cfg)
+    assert mem["rounds"][0]["accepted"] is False
+
+
+def test_unexpected_tracked_change_aborts_round(tmp_path, monkeypatch):
+    """每轮边界出现白名单外 tracked 改动 → 立即中止(不提交)。"""
+    cfg = _loop_cfg(tmp_path)
+    calls = _patch_git(monkeypatch)
+
+    monkeypatch.setattr(search, "optimize",
+                        lambda space, ev, n_calls: ({"enemy_hp": 30},
+                                                    _eval_result(mean=1.0)))
+
+    summary = optimize.optimize_loop(
+        cfg,
+        propose_fn=lambda rep, tun, mem, stage: _PLAN,
+        baseline_fn=lambda c: _eval_result(mean=5.0),
+        evaluator_fn=lambda point: _eval_result(mean=1.0),
+        # Gate 0b:发现白名单外 tracked 改动
+        tracked_changes_fn=lambda c: ["harness/optimize.py"],
+    )
+
+    assert calls["commit"] == []
+    assert summary.get("aborted") is True
+
+
+def test_loop_commits_only_stage1_tunables_whitelist(tmp_path, monkeypatch):
+    """阶段1 commit 路径固定为 repo-relative testbed_platformer/rl/tunables.json。"""
+    cfg = _loop_cfg(tmp_path)
+    calls = _patch_git(monkeypatch)
+
+    monkeypatch.setattr(search, "optimize",
+                        lambda space, ev, n_calls: ({"enemy_hp": 30},
+                                                    _eval_result(mean=1.0)))
+
+    optimize.optimize_loop(
+        cfg,
+        propose_fn=lambda rep, tun, mem, stage: _PLAN,
+        baseline_fn=lambda c: _eval_result(mean=5.0),
+        evaluator_fn=lambda point: _eval_result(mean=1.0),
+        tracked_changes_fn=lambda c: [],
+    )
+
+    assert len(calls["commit"]) == 1
+    committed = calls["commit"][0]
+    assert committed == ["testbed_platformer/rl/tunables.json"]
+
+
+def test_config_validate_rejects_bad_eval_fields(tmp_path):
+    """Config.validate() 严格校验配对评估字段。"""
+    cfg = _loop_cfg(tmp_path)
+
+    # 空 eval_seeds
+    cfg.eval_seeds = ()
+    with pytest.raises(ValueError):
+        cfg.validate()
+
+    # 重复 seed
+    cfg.eval_seeds = (1, 1, 2)
+    with pytest.raises(ValueError):
+        cfg.validate()
+
+    # eval_episodes <= 0
+    cfg.eval_seeds = (1, 2, 3)
+    cfg.eval_episodes = 0
+    with pytest.raises(ValueError):
+        cfg.validate()
+
+    # max_eval_steps < eval_episodes
+    cfg.eval_episodes = 20
+    cfg.max_eval_steps = 5
+    with pytest.raises(ValueError):
+        cfg.validate()
+
+    # eval_timeout_seconds <= 0
+    cfg.max_eval_steps = 40000
+    cfg.eval_timeout_seconds = 0
+    with pytest.raises(ValueError):
+        cfg.validate()
+
+    # min_improvement < 0
+    cfg.eval_timeout_seconds = 30
+    cfg.min_improvement = -0.1
+    with pytest.raises(ValueError):
+        cfg.validate()
+
+    # 全部合法 → 不抛
+    cfg.min_improvement = 0.1
+    cfg.validate()
 
 
 # ─────────────────────────────────────────────────────────────────────
