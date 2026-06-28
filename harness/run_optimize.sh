@@ -92,7 +92,7 @@ OPT_RUN_ID="opt-$(date +%Y%m%d-%H%M%S)-$$"
 : "${SMOKE_TIMEOUT_SECONDS:=120}"
 # 默认 protected 点名测量装置文件(game_agent.gd 含 GOAL_X/FALL_Y/reward;
 # telemetry/recorder 是落盘装置)——防 structural patch 改尺子(critic C2)。
-: "${PROTECTED_PATHS:=harness/**,.git/**,tests/**,docs/**,*/rl/game_agent.gd,*/rl/telemetry.gd,*/rl/recorder.gd}"
+: "${PROTECTED_PATHS:=harness/**,.git/**,tests/**,docs/**,*/rl/game_agent.gd,*/rl/telemetry.gd,*/rl/recorder.gd,personas/*.json}"
 
 # ─── tunables 路径（阶段1 固定白名单）───────────────────────────────────────
 : "${TUNABLES_PATH:=$PROJ/rl/tunables.json}"

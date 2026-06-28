@@ -48,7 +48,10 @@ import evaluation
 # 这些是「尺子」,structural patch 绝不能碰。因目标游戏各异,须显式点名该游戏的测量文件。
 DEFAULT_PROTECTED = (
     "harness/**,.git/**,tests/**,docs/**,"
-    "*/rl/game_agent.gd,*/rl/telemetry.gd,*/rl/recorder.gd")
+    "*/rl/game_agent.gd,*/rl/telemetry.gd,*/rl/recorder.gd,"
+    # persona reward profile = 冻结仪器面板(主观体验层),优化闭环永不改(critic M1)。
+    # 仓根 glob;已验 fnmatch('personas/x.json','personas/*.json')==True。
+    "personas/*.json")
 
 # 阶段1 唯一可提交的白名单路径(repo-relative)。结构/逻辑改动属阶段 2/3,
 # 阶段1 只允许写真实玩法参数,提交粒度固定到这一个文件。
@@ -212,8 +215,13 @@ def run_playtest_and_diagnose(cfg: Config) -> dict:
 # --------------------------------------------------------------------------- #
 
 def has_high_issue(report: dict) -> bool:
-    """report 是否仍有 high severity 的 issue。"""
-    return any(i.get("severity") == "high" for i in report.get("issues", []))
+    """report 是否仍有 high severity 的 issue。
+
+    Goodhart 防火墙(critic M4):主观/跨 persona 软问题(type=='soft')**绝不**参与早停或
+    被优化锚消费——即便有人误把 soft issue 塞进 report['issues'],这里也防御性地忽略它。
+    """
+    return any(i.get("severity") == "high" and i.get("type") != "soft"
+               for i in report.get("issues", []))
 
 
 # --------------------------------------------------------------------------- #

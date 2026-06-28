@@ -549,3 +549,15 @@ class TestTargetFiles:
         from mutate import target_files
         plan = {"change_type": "tunable_search", "files": []}
         assert target_files(plan, proj_rel="testbed_platformer") == []
+
+
+def test_allowed_rejects_persona_profile():
+    """persona reward profile 是冻结仪器,默认 PROTECTED 仓根 glob personas/*.json 护住
+    (critic M1);allowed 须拒绝触碰它的 plan。显式验 fnmatch 行为,不假定 ** 递归。"""
+    from mutate import allowed
+    globs = ["harness/**", ".git/**", "tests/**", "docs/**",
+             "*/rl/game_agent.gd", "personas/*.json"]
+    assert allowed({"files": ["personas/aggressive.json"]}, globs) is False
+    assert allowed({"files": ["personas/default.json"]}, globs) is False
+    # 非 persona 的普通游戏文件仍放行
+    assert allowed({"files": ["testbed_platformer/rl/train_map.tscn"]}, globs) is True

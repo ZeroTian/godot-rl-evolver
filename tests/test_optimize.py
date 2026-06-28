@@ -934,3 +934,15 @@ def test_paired_delta_variance_is_lower_than_unpaired_delta():
     assert _variance(paired_deltas) < _variance(unpaired_deltas)
     # 配对差值应恒等(方差为 0),证明 seed 配对确实抵消了噪声
     assert _variance(paired_deltas) == pytest.approx(0.0)
+
+
+def test_has_high_issue_ignores_soft_issues():
+    """Goodhart 防火墙(critic M4):主观软问题(type='soft')即便误带 severity=high
+    也不参与早停/不被消费;真正的 high 客观 issue 才触发。"""
+    soft_only = {"issues": [
+        {"id": "difficulty_varies_by_persona", "severity": "high", "type": "soft"}]}
+    assert optimize.has_high_issue(soft_only) is False
+    mixed = {"issues": [
+        {"id": "difficulty_varies_by_persona", "severity": "high", "type": "soft"},
+        {"id": "difficulty_too_hard", "severity": "high"}]}
+    assert optimize.has_high_issue(mixed) is True
