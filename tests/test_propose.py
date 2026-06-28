@@ -216,6 +216,12 @@ SAMPLE_MEMORY = {"scene": "res://rl/train_map.tscn", "rounds": []}
 class TestProposeMocked:
     """propose() 的全部 LLM 调用必须被 mock，不得真调 API。"""
 
+    @pytest.fixture(autouse=True)
+    def _force_anthropic_backend(self, monkeypatch):
+        # 固定走 anthropic 后端,否则无 ANTHROPIC_API_KEY 时 _select_backend 会
+        # 路由到 claude_cli 真调本机 CLI(挂起)。
+        monkeypatch.setenv("LLM_BACKEND", "anthropic")
+
     def _make_mock_response(self, plan_dict):
         """构造一个模拟 anthropic SDK tool-use 响应。"""
         mock_response = MagicMock()
@@ -548,3 +554,80 @@ class TestParsePlanTestbedParams:
         }
         result = parse_plan(json.dumps(plan), TESTBED_TUNABLES, stage=1)
         assert len(result["search_space"]) == 3
+
+
+# ---------------------------------------------------------------------------
+# propose 后端选择 + claude_cli 后端(subprocess mock,绝不真调 CLI)
+# ---------------------------------------------------------------------------
+
+from harness import llm_propose  # noqa: E402
+
+_VALID_PLAN = {
+    "target_issue": "difficulty_too_hard",
+    "hypothesis": "敌人血量偏高",
+    "change_type": "tunable_search",
+    "search_space": [{"key": "enemy_hp", "range": [20, 80]}],
+    "expected_effect": "通关率提升",
+    "confidence": 0.6,
+}
+
+
+def _cli_envelope(plan, is_error=False):
+    """构造 claude CLI 的输出信封(含 structured_output + result)。"""
+    return json.dumps({
+        "type": "result", "subtype": "success", "is_error": is_error,
+        "result": json.dumps(plan),
+        "structured_output": plan,
+    })
+
+
+class TestBackendSelection:
+    def test_auto_prefers_anthropic_when_key_set(self, monkeypatch):
+        monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-test")
+        monkeypatch.delenv("LLM_BACKEND", raising=False)
+        assert llm_propose._select_backend() == "anthropic"
+
+    def test_auto_falls_back_to_claude_cli_without_key(self, monkeypatch):
+        monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+        monkeypatch.delenv("LLM_BACKEND", raising=False)
+        monkeypatch.setattr(llm_propose.shutil, "which", lambda name: "/usr/bin/claude")
+        assert llm_propose._select_backend() == "claude_cli"
+
+    def test_explicit_backend_overrides(self, monkeypatch):
+        monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-test")
+        monkeypatch.setenv("LLM_BACKEND", "claude_cli")
+        assert llm_propose._select_backend() == "claude_cli"
+
+    def test_no_backend_raises(self, monkeypatch):
+        monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+        monkeypatch.delenv("LLM_BACKEND", raising=False)
+        monkeypatch.setattr(llm_propose.shutil, "which", lambda name: None)
+        with pytest.raises(RuntimeError, match="无可用 LLM 后端"):
+            llm_propose._select_backend()
+
+
+class TestClaudeCliBackend:
+    def test_parses_structured_output(self, monkeypatch):
+        monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+        monkeypatch.setenv("LLM_BACKEND", "claude_cli")
+        fake = MagicMock(returncode=0, stdout=_cli_envelope(_VALID_PLAN), stderr="")
+        monkeypatch.setattr(llm_propose.subprocess, "run", lambda *a, **k: fake)
+        plan = propose({"issues": [], "summary": {}}, TESTBED_TUNABLES, {"rounds": []}, stage=1)
+        assert plan["change_type"] == "tunable_search"
+        assert plan["search_space"][0]["key"] == "enemy_hp"
+
+    def test_is_error_envelope_retries_then_raises(self, monkeypatch):
+        monkeypatch.setenv("LLM_BACKEND", "claude_cli")
+        fake = MagicMock(returncode=0, stdout=json.dumps(
+            {"is_error": True, "result": "boom", "subtype": "error"}), stderr="")
+        monkeypatch.setattr(llm_propose.subprocess, "run", lambda *a, **k: fake)
+        with pytest.raises(ValueError, match="claude_cli"):
+            propose({"issues": [], "summary": {}}, TESTBED_TUNABLES, {"rounds": []}, stage=1)
+
+    def test_invalid_plan_from_cli_raises(self, monkeypatch):
+        monkeypatch.setenv("LLM_BACKEND", "claude_cli")
+        bad = dict(_VALID_PLAN, change_type="logic")  # stage1 不允许 logic
+        fake = MagicMock(returncode=0, stdout=_cli_envelope(bad), stderr="")
+        monkeypatch.setattr(llm_propose.subprocess, "run", lambda *a, **k: fake)
+        with pytest.raises(ValueError):
+            propose({"issues": [], "summary": {}}, TESTBED_TUNABLES, {"rounds": []}, stage=1)

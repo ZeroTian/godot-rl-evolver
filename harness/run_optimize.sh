@@ -34,8 +34,14 @@ HARNESS="$(cd "$(dirname "$0")" && pwd)"
 : "${PROJ:=$REPO_ROOT/testbed_platformer}"
 : "${SCENE:?需设置 SCENE=res://训练场景.tscn}"
 
-# ─── 必填凭据 ────────────────────────────────────────────────────────────────
-: "${ANTHROPIC_API_KEY:?需设置 ANTHROPIC_API_KEY（走环境变量，绝不入库）}"
+# ─── LLM 后端 ───────────────────────────────────────────────────────────────
+# 二选一即可:① ANTHROPIC_API_KEY(走 anthropic SDK)② 本机 claude CLI(复用 Claude
+# Code 订阅认证,免 key)。LLM_BACKEND 可显式指定 anthropic|claude_cli,默认 auto。
+if [ -z "${ANTHROPIC_API_KEY:-}" ] && ! command -v claude >/dev/null 2>&1; then
+  echo "!! 无可用 LLM 后端:既未设 ANTHROPIC_API_KEY,也找不到 claude CLI。" >&2
+  echo "   二选一:export ANTHROPIC_API_KEY=...  或  安装 Claude Code CLI(claude)。" >&2
+  exit 1
+fi
 
 # ─── Gate 0：脏工作树检查（必须在建分支前）──────────────────────────────────
 if ! ( cd "$REPO_ROOT" && git rev-parse --git-dir >/dev/null 2>&1 ); then
@@ -119,7 +125,7 @@ export STAGE TARGET_COMPLETION MAX_ROUNDS PATIENCE SEARCH_CALLS RETRAIN_EACH PRO
 export TUNABLES_PATH MEMORY_PATH REPORT_PATH
 export OPT_RUN_ID ARTIFACT_ROOT
 export EVAL_SEEDS EVAL_EPISODES MAX_EVAL_STEPS EVAL_TIMEOUT_SECONDS MIN_IMPROVEMENT
-export ANTHROPIC_API_KEY
+export ANTHROPIC_API_KEY LLM_BACKEND
 
 echo "=== 启动优化闭环（STAGE=$STAGE MAX_ROUNDS=$MAX_ROUNDS target=$TARGET_COMPLETION SEARCH_CALLS=$SEARCH_CALLS）==="
 python "$HARNESS/optimize.py"

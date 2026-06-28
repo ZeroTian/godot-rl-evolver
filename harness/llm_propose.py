@@ -37,12 +37,17 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
+import subprocess
 from typing import Any
 
 try:
     import anthropic
 except ImportError:  # 允许在没装 SDK 的环境里 import（测试 mock 时不需要真 SDK）
     anthropic = None  # type: ignore
+
+# claude CLI 单次调用墙钟超时(秒)
+CLAUDE_CLI_TIMEOUT = int(os.environ.get("CLAUDE_CLI_TIMEOUT", "180"))
 
 # 允许的 change_type 值
 VALID_CHANGE_TYPES = {"tunable_search", "structural", "logic"}
@@ -263,24 +268,51 @@ def propose(
         stage:       优化阶段（1=仅 tunable_search，2=+structural，3=+logic）。
         max_retries: 解析失败最多重试次数（默认 MAX_RETRIES=3）。
 
+    后端选择（LLM_BACKEND 环境变量，默认 auto）：
+        - "anthropic"  : 用 anthropic SDK（需 ANTHROPIC_API_KEY）
+        - "claude_cli" : 用本机 `claude -p` CLI（复用 Claude Code 订阅认证，免 API key）
+        - "auto"（默认）: 有 ANTHROPIC_API_KEY → anthropic；否则有 claude CLI → claude_cli
+
     Returns:
         parse_plan 校验通过的改动计划 dict。
 
     Raises:
         ValueError: 超过重试上限仍无法得到合法计划。
-        RuntimeError: anthropic SDK 未安装。
+        RuntimeError: 无可用后端（既无 ANTHROPIC_API_KEY 也无 claude CLI）。
     """
+    prompt = _build_prompt(report, tunables, memory, stage)
+    backend = _select_backend()
+    if backend == "claude_cli":
+        return _propose_via_claude_cli(prompt, tunables, stage, max_retries)
+    return _propose_via_anthropic(prompt, tunables, stage, max_retries)
+
+
+def _select_backend() -> str:
+    """决定用哪个 LLM 后端。"""
+    b = os.environ.get("LLM_BACKEND", "auto").lower()
+    if b in ("anthropic", "claude_cli"):
+        return b
+    # auto：显式设了 API key 用 SDK,否则有 claude CLI 就用它
+    if os.environ.get("ANTHROPIC_API_KEY"):
+        return "anthropic"
+    if shutil.which("claude"):
+        return "claude_cli"
+    raise RuntimeError(
+        "无可用 LLM 后端：未设 ANTHROPIC_API_KEY 且找不到 claude CLI。"
+        "请设 ANTHROPIC_API_KEY,或安装 Claude Code CLI(claude)。"
+    )
+
+
+def _propose_via_anthropic(
+    prompt: str, tunables: dict, stage: int, max_retries: int
+) -> dict:
+    """anthropic SDK 后端（structured output via tool use）。"""
     if anthropic is None:
-        raise RuntimeError(
-            "anthropic SDK 未安装。请运行：pip install anthropic"
-        )
+        raise RuntimeError("anthropic SDK 未安装。请运行：pip install anthropic")
 
     client = anthropic.Anthropic()  # 自动读取 ANTHROPIC_API_KEY 环境变量
-
-    prompt = _build_prompt(report, tunables, memory, stage)
-
     last_error: Exception | None = None
-    for attempt in range(max_retries):
+    for _ in range(max_retries):
         response = client.messages.create(
             model=os.environ.get("ANTHROPIC_MODEL", "claude-opus-4-8"),
             max_tokens=1024,
@@ -288,17 +320,72 @@ def propose(
             tool_choice={"type": "tool", "name": "submit_change_plan"},
             messages=[{"role": "user", "content": prompt}],
         )
-
-        # 从 tool_use 响应中提取 input（已是 dict，无需再 JSON 解析）
         plan_input = _extract_tool_input(response)
         try:
-            return parse_plan(json.dumps(plan_input), tunables)
+            return parse_plan(json.dumps(plan_input), tunables, stage)
         except ValueError as e:
             last_error = e
-            # 继续重试
 
     raise ValueError(
-        f"LLM 在 {max_retries} 次尝试后仍未返回合法改动计划。"
+        f"LLM(anthropic)在 {max_retries} 次尝试后仍未返回合法改动计划。"
+        f"最后错误：{last_error}"
+    )
+
+
+def _propose_via_claude_cli(
+    prompt: str, tunables: dict, stage: int, max_retries: int
+) -> dict:
+    """claude CLI 后端：`claude -p --output-format json --json-schema <schema>`。
+
+    复用本机 Claude Code 认证,无需 ANTHROPIC_API_KEY。CLI 输出信封含
+    structured_output(已解析对象)/ result(JSON 字符串)/ is_error。
+    """
+    schema = json.dumps(_PLAN_TOOL["input_schema"], ensure_ascii=False)
+    cmd = [
+        "claude", "-p",
+        "--output-format", "json",
+        "--json-schema", schema,
+        prompt,
+    ]
+    last_error: Exception | None = None
+    for _ in range(max_retries):
+        try:
+            proc = subprocess.run(
+                cmd, capture_output=True, text=True, timeout=CLAUDE_CLI_TIMEOUT,
+            )
+        except subprocess.TimeoutExpired as e:
+            last_error = e
+            continue
+        if proc.returncode != 0:
+            last_error = RuntimeError(
+                f"claude CLI rc={proc.returncode}: {(proc.stderr or '')[-500:]}"
+            )
+            continue
+        try:
+            envelope = json.loads(proc.stdout)
+        except json.JSONDecodeError as e:
+            last_error = RuntimeError(f"claude CLI 输出非 JSON：{e}")
+            continue
+        if envelope.get("is_error"):
+            last_error = RuntimeError(
+                f"claude CLI 报错：{envelope.get('result') or envelope.get('subtype')}"
+            )
+            continue
+        # 优先用已解析的 structured_output,回退到 result(JSON 字符串)
+        plan_obj = envelope.get("structured_output")
+        if plan_obj is None:
+            try:
+                plan_obj = json.loads(envelope.get("result", ""))
+            except (json.JSONDecodeError, TypeError) as e:
+                last_error = RuntimeError(f"claude CLI 无 structured_output 且 result 不可解析：{e}")
+                continue
+        try:
+            return parse_plan(json.dumps(plan_obj), tunables, stage)
+        except ValueError as e:
+            last_error = e
+
+    raise ValueError(
+        f"LLM(claude_cli)在 {max_retries} 次尝试后仍未返回合法改动计划。"
         f"最后错误：{last_error}"
     )
 
@@ -358,7 +445,7 @@ def _build_prompt(report: dict, tunables: dict, memory: dict, stage: int) -> str
 
 {memory_summary}
 
-请用 submit_change_plan 工具提交你的改动计划。
+请提交一个改动计划(严格符合改动计划 JSON schema:target_issue/hypothesis/change_type/expected_effect 必填,tunable_search 时含 search_space)。
 """.strip()
 
 
