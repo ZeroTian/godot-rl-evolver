@@ -27,7 +27,15 @@ PYPID=$!
 sleep 6
 
 echo "=== 启动 Godot(非 headless,开窗口渲染 + Recorder 截图) ==="
-( cd "$PROJ" && "$GODOT" --path . "$SCENE" --port=$PORT \
+# WSL→Windows-Godot 默认不传自定义环境变量;用 WSLENV 把 TELEMETRY_DIR 以 /p(路径翻译
+# /mnt/e/... → E:\...)传入,否则 telemetry.gd 收不到、落回 res://rl/telemetry,隔离失效。
+# TELEMETRY_DIR 未设时传空,telemetry.gd 自动回退默认目录。
+#   TELEMETRY_DIR 用 /p 翻译路径;MODEL 仅作 provenance 标识(telemetry run 头记录,供
+#   validate_telemetry 比对),按原样传(不加 /p,否则 /home/... 被译成 UNC 路径反而对不上)。
+( cd "$PROJ" && \
+    TELEMETRY_DIR="${TELEMETRY_DIR:-}" MODEL="${MODEL:-}" \
+    WSLENV="${WSLENV:+$WSLENV:}TELEMETRY_DIR/p:MODEL" \
+    "$GODOT" --path . "$SCENE" --port=$PORT \
     --speedup=$SPEEDUP --env_seed=$EVAL_SEED ) \
   > /tmp/infer_godot.log 2>&1 &
 GPID=$!
