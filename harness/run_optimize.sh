@@ -87,7 +87,12 @@ OPT_RUN_ID="opt-$(date +%Y%m%d-%H%M%S)-$$"
 : "${PATIENCE:=3}"
 : "${SEARCH_CALLS:=12}"
 : "${RETRAIN_EACH:=0}"
-: "${PROTECTED_PATHS:=harness/**,.git/**,tests/**,docs/**}"
+# 阶段2 smoke gate 预算(结构改动:apply→语法→smoke→指标)。
+: "${SMOKE_MAX_STEPS:=2000}"
+: "${SMOKE_TIMEOUT_SECONDS:=120}"
+# 默认 protected 点名测量装置文件(game_agent.gd 含 GOAL_X/FALL_Y/reward;
+# telemetry/recorder 是落盘装置)——防 structural patch 改尺子(critic C2)。
+: "${PROTECTED_PATHS:=harness/**,.git/**,tests/**,docs/**,*/rl/game_agent.gd,*/rl/telemetry.gd,*/rl/recorder.gd}"
 
 # ─── tunables 路径（阶段1 固定白名单）───────────────────────────────────────
 : "${TUNABLES_PATH:=$PROJ/rl/tunables.json}"
@@ -122,6 +127,7 @@ echo "=== 切到优化分支 $OPT_BRANCH（在 $REPO_ROOT）==="
 # ─── Export 全部配置给 optimize.py ──────────────────────────────────────────
 export REPO_ROOT PROJ SCENE MODEL SPEEDUP GODOT VENV
 export STAGE TARGET_COMPLETION MAX_ROUNDS PATIENCE SEARCH_CALLS RETRAIN_EACH PROTECTED_PATHS
+export SMOKE_MAX_STEPS SMOKE_TIMEOUT_SECONDS
 export TUNABLES_PATH MEMORY_PATH REPORT_PATH
 export OPT_RUN_ID ARTIFACT_ROOT
 export EVAL_SEEDS EVAL_EPISODES MAX_EVAL_STEPS EVAL_TIMEOUT_SECONDS MIN_IMPROVEMENT

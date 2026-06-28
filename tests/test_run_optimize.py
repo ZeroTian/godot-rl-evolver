@@ -298,6 +298,36 @@ def test_default_proj_is_testbed(tmp_path):
 
 
 # ---------------------------------------------------------------------------
+# 契约 7（阶段2）：smoke 预算变量 + STAGE 透传 + PROTECTED 含测量 glob
+# ---------------------------------------------------------------------------
+
+def test_stage2_smoke_and_protected_vars_exported(tmp_path):
+    """SMOKE_MAX_STEPS/SMOKE_TIMEOUT_SECONDS 必须 export 给 optimize.py；
+    STAGE 不写死(可由环境覆盖)；默认 PROTECTED_PATHS 含测量装置 glob。"""
+    result = _run_script(tmp_path, extra_env={"STAGE": "2"})
+
+    py_env_log = tmp_path / "py_env.log"
+    assert py_env_log.exists(), (
+        f"fake python 未被调用\nstdout: {result.stdout}\nstderr: {result.stderr}")
+    env_text = py_env_log.read_text()
+    lines = env_text.splitlines()
+
+    for var in ["SMOKE_MAX_STEPS", "SMOKE_TIMEOUT_SECONDS"]:
+        assert any(l.startswith(f"{var}=") for l in lines), (
+            f"变量 {var} 未透传给 optimize.py\n完整 env:\n{env_text}")
+
+    # STAGE 透传且尊重环境覆盖(=2)
+    stage_line = next((l for l in lines if l.startswith("STAGE=")), None)
+    assert stage_line == "STAGE=2", f"STAGE 应透传为 2，实际: {stage_line}"
+
+    # 默认 PROTECTED_PATHS 点名测量装置文件
+    prot_line = next((l for l in lines if l.startswith("PROTECTED_PATHS=")), None)
+    assert prot_line is not None, f"PROTECTED_PATHS 未透传\n{env_text}"
+    assert "*/rl/game_agent.gd" in prot_line, (
+        f"默认 PROTECTED_PATHS 应含测量装置 glob，实际: {prot_line}")
+
+
+# ---------------------------------------------------------------------------
 # 契约 6：Gate 0（脏树）在 git checkout 前执行（顺序保证）
 # ---------------------------------------------------------------------------
 
